@@ -1,0 +1,98 @@
+[package]
+name = "sylphra"
+version = "0.0.0-alpha"
+edition = "2021"
+authors = ["Sylphra"]
+description = "A lightweight document-focused browser written in safe Rust"
+license-file = "LICENSE"
+publish = false
+default-run = "sylphra"
+repository = "https://github.com/ghitatruongle/Sylphra-Browser"
+readme = "README.md"
+keywords = ["browser", "html", "css", "rust", "windows"]
+categories = ["gui", "web-programming"]
+
+[dependencies]
+iced = { version = "0.12", default-features = false, features = ["tokio", "image", "canvas", "system"] }
+iced_core = "0.12"
+cosmic-text = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls",
+    "http2",
+    "charset",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "system-proxy",
+] }
+image = "0.24"
+log = "0.4"
+env_logger = "0.11"
+ureq = { version = "2.9", features = ["json", "brotli", "charset", "gzip"] }
+encoding_rs = "0.8"
+url = "2.5"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0", features = ["unbounded_depth"] }
+chrono = "0.4"
+anyhow = "1.0"
+dirs = "5.0"
+flate2 = "1.0"
+ed25519-dalek = "2.1"
+sha2 = "0.10"
+semver = "1.0"
+fs2 = "0.4"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_JobObjects",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Credentials",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_Storage",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+wgpu = { version = "0.19.4", default-features = false, features = ["dx12", "wgsl"] }
+pollster = "1.0.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+
+[build-dependencies]
+winres = "0.1"
+
+[dev-dependencies]
+criterion = "0.5"
+rstest = "0.18"
+
+[profile.dev]
+debug = 0
+incremental = false
+split-debuginfo = "off"
+
+[profile.test]
+debug = 0
+incremental = false
+split-debuginfo = "off"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+
+[[bench]]
+name = "engine_bench"
+harness = false

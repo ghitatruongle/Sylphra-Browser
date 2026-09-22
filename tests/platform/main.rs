@@ -1,0 +1,11 @@
+mod crash_recovery;
+mod extension_security;
+mod hardening;
+mod installed_app;
+mod multiprocess_ipc;
+mod permissions;
+mod sandbox_isolation;
+mod security_compatibility;
+mod updater;
+mod windows_integration;
+mod worker_isolation;

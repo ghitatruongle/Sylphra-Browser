@@ -1,0 +1,17 @@
+mod accessibility;
+mod canvas_svg;
+mod css;
+mod css_conformance;
+mod dom_runtime_backlog;
+mod dynamic_rendering;
+mod ecmascript;
+mod ecmascript_compatibility;
+mod layout_conformance;
+mod live_dom;
+mod offline_spa;
+mod parser;
+mod shadow_dom;
+mod spa_conformance;
+mod test262_style;
+mod test262_subset;
+mod wasm_conformance;
