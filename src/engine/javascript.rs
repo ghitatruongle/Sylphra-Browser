@@ -70,13 +70,13 @@ impl JsvHost for NoHost {
     }
 }
 
-const MAX_EVAL_STEPS: u64 = 5_000_000;
-const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_TOKENS: usize = 262_144;
+const MAX_EVAL_STEPS: u64 = crate::resource_caps::JS_MAX_EVAL_STEPS;
+const MAX_SOURCE_BYTES: usize = crate::resource_caps::JS_MAX_SOURCE_BYTES;
+const MAX_TOKENS: usize = crate::resource_caps::JS_MAX_TOKENS;
 
-const MAX_STRING_LENGTH: usize = 2 * 1024 * 1024;
+const MAX_STRING_LENGTH: usize = crate::resource_caps::JS_MAX_STRING_BYTES;
 
-const MAX_STRING_BUDGET: usize = 32 * 1024 * 1024;
+const MAX_STRING_BUDGET: usize = crate::resource_caps::JS_MAX_STRING_BUDGET_BYTES;
 
 #[cfg(debug_assertions)]
 const MAX_CALL_DEPTH: u64 = 8;

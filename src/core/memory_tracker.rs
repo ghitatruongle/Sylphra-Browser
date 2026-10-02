@@ -1,11 +1,13 @@
 use crate::image_loader::ImageCache;
 use crate::layout::LayoutNode;
+use crate::memory_probe::SystemMemory;
 use crate::parser::Element;
+use crate::resource_caps;
 use crate::tab::Tab;
 
-const BYTES_PER_DOM_NODE: usize = 210;
+pub const BYTES_PER_DOM_NODE: usize = resource_caps::DOM_NODE_ESTIMATE_BYTES;
 
-const BYTES_PER_LAYOUT_NODE: usize = 320;
+pub const BYTES_PER_LAYOUT_NODE: usize = resource_caps::DOM_LAYOUT_NODE_ESTIMATE_BYTES;
 
 #[derive(Debug, Clone, Default)]
 pub struct TabMemoryEstimate {
@@ -68,6 +70,26 @@ impl MemoryBudget {
             MemoryPressureLevel::Normal
         }
     }
+
+    pub fn level_for_with_system(self, bytes: usize, system: SystemMemory) -> MemoryPressureLevel {
+        let bytes_level = self.level_for(bytes);
+        if bytes_level == MemoryPressureLevel::Disabled {
+            return MemoryPressureLevel::Disabled;
+        }
+        let available = system.has_information().then_some(system.available_bytes);
+        bytes_level.strongest(system_level_for(available, false))
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            soft_limit_bytes: 0,
+            hard_limit_bytes: 0,
+        }
+    }
+
+    pub fn is_enforced(self) -> bool {
+        self.hard_limit_bytes > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,6 +99,175 @@ pub enum MemoryPressureLevel {
     Normal,
     Moderate,
     Critical,
+    Emergency,
+}
+
+impl MemoryPressureLevel {
+    pub fn rank(self) -> u8 {
+        match self {
+            MemoryPressureLevel::Disabled => 0,
+            MemoryPressureLevel::Normal => 1,
+            MemoryPressureLevel::Moderate => 2,
+            MemoryPressureLevel::Critical => 3,
+            MemoryPressureLevel::Emergency => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MemoryPressureLevel::Disabled => "off",
+            MemoryPressureLevel::Normal => "normal",
+            MemoryPressureLevel::Moderate => "moderate",
+            MemoryPressureLevel::Critical => "critical",
+            MemoryPressureLevel::Emergency => "emergency",
+        }
+    }
+
+    pub fn relief_required(self) -> bool {
+        matches!(
+            self,
+            MemoryPressureLevel::Moderate
+                | MemoryPressureLevel::Critical
+                | MemoryPressureLevel::Emergency
+        )
+    }
+
+    pub fn shed_immediately(self) -> bool {
+        matches!(
+            self,
+            MemoryPressureLevel::Critical | MemoryPressureLevel::Emergency
+        )
+    }
+
+    fn strongest(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+fn bytes_level_for(budget: MemoryBudget, bytes: usize, tightened: bool) -> MemoryPressureLevel {
+    if budget.hard_limit_bytes == 0 {
+        return MemoryPressureLevel::Disabled;
+    }
+    let soft = if tightened {
+        budget.soft_limit_bytes * resource_caps::PRESSURE_HYSTERESIS_PERCENT / 100
+    } else {
+        budget.soft_limit_bytes
+    };
+    let hard = if tightened {
+        budget.hard_limit_bytes * resource_caps::PRESSURE_HYSTERESIS_PERCENT / 100
+    } else {
+        budget.hard_limit_bytes
+    };
+    if bytes >= hard {
+        MemoryPressureLevel::Critical
+    } else if bytes >= soft {
+        MemoryPressureLevel::Moderate
+    } else {
+        MemoryPressureLevel::Normal
+    }
+}
+
+fn system_level_for(available_bytes: Option<u64>, tightened: bool) -> MemoryPressureLevel {
+    let Some(available) = available_bytes else {
+        return MemoryPressureLevel::Normal;
+    };
+    let scale: u64 = if tightened {
+        (200 - resource_caps::PRESSURE_HYSTERESIS_PERCENT) as u64
+    } else {
+        100
+    };
+    let moderate = resource_caps::SYSTEM_MODERATE_AVAILABLE_MB * scale / 100;
+    let critical = resource_caps::SYSTEM_CRITICAL_AVAILABLE_MB * scale / 100;
+    let emergency = resource_caps::SYSTEM_EMERGENCY_AVAILABLE_MB * scale / 100;
+    if available < emergency * 1024 * 1024 {
+        MemoryPressureLevel::Emergency
+    } else if available < critical * 1024 * 1024 {
+        MemoryPressureLevel::Critical
+    } else if available < moderate * 1024 * 1024 {
+        MemoryPressureLevel::Moderate
+    } else {
+        MemoryPressureLevel::Normal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PressureReading {
+    pub level: MemoryPressureLevel,
+    pub consumed_bytes: usize,
+    pub system_available_bytes: u64,
+    pub driven_by_system: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct PressureGovernor {
+    current: MemoryPressureLevel,
+    last_reading: Option<PressureReading>,
+}
+
+impl PressureGovernor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn level(&self) -> MemoryPressureLevel {
+        self.current
+    }
+
+    pub fn last_reading(&self) -> Option<PressureReading> {
+        self.last_reading
+    }
+
+    pub fn reset(&mut self) {
+        self.current = MemoryPressureLevel::default();
+        self.last_reading = None;
+    }
+
+    pub fn observe(
+        &mut self,
+        budget: MemoryBudget,
+        consumed_bytes: usize,
+        system: SystemMemory,
+    ) -> PressureReading {
+        let available = system.has_information().then_some(system.available_bytes);
+        let bytes_level = bytes_level_for(budget, consumed_bytes, false);
+        let system_level = system_level_for(available, false);
+        if bytes_level == MemoryPressureLevel::Disabled {
+            let reading = PressureReading {
+                level: MemoryPressureLevel::Disabled,
+                consumed_bytes,
+                system_available_bytes: available.unwrap_or_default(),
+                driven_by_system: false,
+            };
+            self.current = MemoryPressureLevel::Disabled;
+            self.last_reading = Some(reading);
+            return reading;
+        }
+        let raw = bytes_level.strongest(system_level);
+        let adopted = if raw.rank() >= self.current.rank() {
+            raw
+        } else {
+            let strict = bytes_level_for(budget, consumed_bytes, true)
+                .strongest(system_level_for(available, true));
+            if strict.rank() < self.current.rank() {
+                raw
+            } else {
+                self.current
+            }
+        };
+        self.current = adopted;
+        let reading = PressureReading {
+            level: adopted,
+            consumed_bytes,
+            system_available_bytes: available.unwrap_or_default(),
+            driven_by_system: system_level.rank() > bytes_level.rank(),
+        };
+        self.last_reading = Some(reading);
+        reading
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,6 +278,25 @@ pub struct MemoryReliefReport {
     pub cache_bytes_freed: usize,
     pub slept_tabs: Vec<usize>,
     pub discarded_tabs: Vec<usize>,
+    pub measured_working_set_bytes: u64,
+    pub system_available_bytes: u64,
+    pub released_ledger_bytes: usize,
+    pub relief_passes: usize,
+    pub shed_renderers: usize,
+}
+
+impl MemoryReliefReport {
+    pub fn bytes_freed(&self) -> usize {
+        self.before_bytes.saturating_sub(self.after_bytes)
+    }
+
+    pub fn acted(&self) -> bool {
+        !self.slept_tabs.is_empty()
+            || !self.discarded_tabs.is_empty()
+            || self.cache_bytes_freed > 0
+            || self.released_ledger_bytes > 0
+            || self.shed_renderers > 0
+    }
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +305,14 @@ pub struct MemoryTracker;
 impl MemoryTracker {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn dom_node_count(dom: &Element) -> usize {
+        count_dom_nodes(dom)
+    }
+
+    pub fn layout_node_count(layout: &LayoutNode) -> usize {
+        count_layout_nodes(layout)
     }
 
     pub fn estimate_dom(dom: &Element) -> usize {
@@ -112,8 +330,8 @@ impl MemoryTracker {
     }
 
     pub fn estimate_tab(tab: &Tab) -> TabMemoryEstimate {
-        let dom_bytes = Self::estimate_dom(&tab.dom);
-        let layout_bytes = tab.layout.as_ref().map_or(0, Self::estimate_layout);
+        let dom_bytes = tab.estimated_dom_bytes();
+        let layout_bytes = tab.estimated_layout_bytes();
         let history_bytes = MemoryTracker::estimate_history(tab);
 
         let sleep_snapshot_bytes = tab.compressed_snapshot_bytes();
@@ -195,7 +413,7 @@ fn count_dom_nodes(element: &Element) -> usize {
 }
 
 fn count_dom_nodes_with_depth(element: &Element, depth: usize) -> usize {
-    if depth > 1000 {
+    if depth > resource_caps::DOM_MAX_DEPTH {
         return 1;
     }
     1 + element
@@ -210,7 +428,7 @@ fn count_layout_nodes(node: &LayoutNode) -> usize {
 }
 
 fn count_layout_nodes_with_depth(node: &LayoutNode, depth: usize) -> usize {
-    if depth > 1000 {
+    if depth > resource_caps::DOM_MAX_DEPTH {
         return 1;
     }
     1 + node
@@ -223,8 +441,7 @@ fn count_layout_nodes_with_depth(node: &LayoutNode, depth: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css_parser::parse_css;
-    use crate::layout;
+    use crate::memory_probe::SystemMemory;
 
     #[test]
     fn test_count_dom_nodes_simple() {
@@ -247,6 +464,8 @@ mod tests {
 
     #[test]
     fn test_estimate_layout() {
+        use crate::css_parser::parse_css;
+        use crate::layout;
         let dom =
             crate::parser::parse_html("<html><body><h1>Title</h1><p>Content</p></body></html>");
         let rules = parse_css("h1 { font-size: 24px; } p { font-size: 16px; }");
@@ -272,6 +491,8 @@ mod tests {
 
     #[test]
     fn test_estimate_tab_with_layout() {
+        use crate::css_parser::parse_css;
+        use crate::layout;
         let dom =
             crate::parser::parse_html("<html><body><h1>Test</h1><p>Content here</p></body></html>");
         let rules = parse_css("h1 { font-size: 24px; }");
@@ -379,6 +600,133 @@ mod tests {
         assert_eq!(
             budget.level_for(500 * 1024 * 1024),
             MemoryPressureLevel::Critical
+        );
+    }
+
+    const MB_BYTES: usize = 1024 * 1024;
+
+    fn unknown_system() -> SystemMemory {
+        SystemMemory::default()
+    }
+
+    fn system_with_available(mb: u64) -> SystemMemory {
+        SystemMemory {
+            total_bytes: 16 * 1024 * mb,
+            available_bytes: mb * 1024 * 1024,
+            load_percent: 50,
+        }
+    }
+
+    #[test]
+    fn exhausted_system_memory_raises_the_level_above_our_own_usage() {
+        let budget = MemoryBudget::from_mb(400, 500);
+        let level = budget.level_for_with_system(10 * MB_BYTES, system_with_available(300));
+        assert_eq!(level, MemoryPressureLevel::Emergency);
+    }
+
+    #[test]
+    fn healthy_system_memory_keeps_low_usage_normal() {
+        let budget = MemoryBudget::from_mb(400, 500);
+        let level = budget.level_for_with_system(10 * MB_BYTES, system_with_available(8_000));
+        assert_eq!(level, MemoryPressureLevel::Normal);
+    }
+
+    #[test]
+    fn a_disabled_budget_disables_pressure_even_under_system_stress() {
+        let budget = MemoryBudget::disabled();
+        assert!(!budget.is_enforced());
+        assert_eq!(
+            budget.level_for_with_system(4_000 * MB_BYTES, system_with_available(128)),
+            MemoryPressureLevel::Disabled
+        );
+    }
+
+    #[test]
+    fn governor_holds_the_level_until_hysteresis_releases_it() {
+        let budget = MemoryBudget::from_mb(400, 500);
+        let mut governor = PressureGovernor::new();
+        assert_eq!(
+            governor
+                .observe(budget, 500 * MB_BYTES, unknown_system())
+                .level,
+            MemoryPressureLevel::Critical
+        );
+        assert_eq!(
+            governor
+                .observe(budget, 480 * MB_BYTES, unknown_system())
+                .level,
+            MemoryPressureLevel::Critical
+        );
+        assert_eq!(
+            governor
+                .observe(budget, 405 * MB_BYTES, unknown_system())
+                .level,
+            MemoryPressureLevel::Moderate
+        );
+        assert_eq!(
+            governor
+                .observe(budget, 100 * MB_BYTES, unknown_system())
+                .level,
+            MemoryPressureLevel::Normal
+        );
+        assert_eq!(governor.level(), MemoryPressureLevel::Normal);
+    }
+
+    #[test]
+    fn governor_reacts_immediately_when_pressure_rises() {
+        let budget = MemoryBudget::from_mb(400, 500);
+        let mut governor = PressureGovernor::new();
+        governor.observe(budget, 10 * MB_BYTES, unknown_system());
+        let reading = governor.observe(budget, 200 * MB_BYTES, system_with_available(1_000));
+        assert_eq!(reading.level, MemoryPressureLevel::Moderate);
+        assert!(reading.driven_by_system);
+    }
+
+    #[test]
+    fn system_driven_flapping_is_also_damped() {
+        let budget = MemoryBudget::from_mb(400, 500);
+        let mut governor = PressureGovernor::new();
+        assert_eq!(
+            governor
+                .observe(budget, 10 * MB_BYTES, system_with_available(1_000))
+                .level,
+            MemoryPressureLevel::Moderate
+        );
+        assert_eq!(
+            governor
+                .observe(budget, 10 * MB_BYTES, system_with_available(1_600))
+                .level,
+            MemoryPressureLevel::Moderate
+        );
+        assert_eq!(
+            governor
+                .observe(budget, 10 * MB_BYTES, system_with_available(2_000))
+                .level,
+            MemoryPressureLevel::Normal
+        );
+    }
+
+    #[test]
+    fn relief_gates_match_the_level_ladder() {
+        assert!(!MemoryPressureLevel::Disabled.relief_required());
+        assert!(!MemoryPressureLevel::Normal.relief_required());
+        assert!(MemoryPressureLevel::Moderate.relief_required());
+        assert!(MemoryPressureLevel::Critical.relief_required());
+        assert!(MemoryPressureLevel::Emergency.relief_required());
+        assert!(MemoryPressureLevel::Emergency.shed_immediately());
+        assert!(!MemoryPressureLevel::Moderate.shed_immediately());
+        assert_eq!(MemoryPressureLevel::Emergency.label(), "emergency");
+    }
+
+    #[test]
+    fn node_estimate_constants_come_from_the_shared_table() {
+        assert_eq!(
+            BYTES_PER_DOM_NODE,
+            crate::resource_caps::DOM_NODE_ESTIMATE_BYTES
+        );
+        assert_eq!(
+            BYTES_PER_LAYOUT_NODE,
+            crate::resource_caps::DOM_LAYOUT_NODE_ESTIMATE_BYTES
         );
     }
 }

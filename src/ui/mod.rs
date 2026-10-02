@@ -11,6 +11,7 @@ pub mod settings;
 pub mod tab;
 pub mod tab_strip;
 pub mod task_manager;
+#[allow(clippy::module_inception)]
 pub mod ui;
 pub(crate) mod ui_helpers;
 

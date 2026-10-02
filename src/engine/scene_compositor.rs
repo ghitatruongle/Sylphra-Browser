@@ -6,7 +6,7 @@ const MAX_SCENE_PRIMITIVES: usize = 200_000;
 const MAX_DAMAGE_RECTS: usize = 4_096;
 const MAX_SURFACE_DIMENSION: u32 = 8_192;
 const MAX_SURFACE_PIXELS: usize = 64 * 1024 * 1024;
-const MAX_SCENE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_SCENE_BYTES: usize = crate::resource_caps::GPU_SOURCE_AGGREGATE_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneRect {

@@ -42,8 +42,8 @@ struct ShadowRootRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveNodeKind {
     Element {
-        tag: String,
-        attrs: BTreeMap<String, String>,
+        tag: crate::string_pool::InternedString,
+        attrs: BTreeMap<crate::string_pool::InternedString, String>,
         is_void: bool,
     },
     Text(String),
@@ -600,7 +600,8 @@ impl LiveDocument {
         let LiveNodeKind::Element { attrs, .. } = &self.nodes.get(&node)?.kind else {
             return None;
         };
-        attrs.get(&name.to_ascii_lowercase()).map(String::as_str)
+        let lowered = name.to_ascii_lowercase();
+        attrs.get(lowered.as_str()).map(String::as_str)
     }
 
     pub fn attach_shadow(&mut self, host: NodeId, mode: ShadowMode) -> Result<NodeId, String> {
@@ -615,7 +616,7 @@ impl LiveDocument {
             return Err("NotSupportedError: host already has a shadow root".to_string());
         }
         let root = self.allocate(LiveNodeKind::Element {
-            tag: "shadow-root".to_string(),
+            tag: "shadow-root".into(),
             attrs: BTreeMap::new(),
             is_void: false,
         })?;
@@ -1487,7 +1488,7 @@ impl LiveDocument {
         let LiveNodeKind::Element { tag, .. } = &self.nodes.get(&node)?.kind else {
             return None;
         };
-        Some(tag.clone())
+        Some(tag.to_string())
     }
 
     fn mark_mutated(&mut self) {
@@ -1585,10 +1586,10 @@ impl LiveDocument {
             }
             if let Some(value) = parts.next() {
                 let value = value.trim().trim_matches(['\'', '"']);
-                if attrs.get(&name).map(String::as_str) != Some(value) {
+                if attrs.get(name.as_str()).map(String::as_str) != Some(value) {
                     return false;
                 }
-            } else if !attrs.contains_key(&name) {
+            } else if !attrs.contains_key(name.as_str()) {
                 return false;
             }
         }
@@ -1771,7 +1772,7 @@ fn clear_node_ids(element: &mut Element) {
     }
 }
 
-fn normalize_tag(tag: &str) -> Result<String, String> {
+fn normalize_tag(tag: &str) -> Result<crate::string_pool::InternedString, String> {
     let tag = tag.trim().to_ascii_lowercase();
     if tag.is_empty()
         || tag.len() > 64
@@ -1781,10 +1782,10 @@ fn normalize_tag(tag: &str) -> Result<String, String> {
     {
         return Err("InvalidCharacterError: invalid element tag".to_string());
     }
-    Ok(tag)
+    Ok(tag.into())
 }
 
-fn normalize_attribute_name(name: &str) -> Result<String, String> {
+fn normalize_attribute_name(name: &str) -> Result<crate::string_pool::InternedString, String> {
     let name = name.trim().to_ascii_lowercase();
     if name.is_empty()
         || name.len() > 128
@@ -1795,7 +1796,7 @@ fn normalize_attribute_name(name: &str) -> Result<String, String> {
     {
         return Err("InvalidCharacterError: invalid attribute name".to_string());
     }
-    Ok(name)
+    Ok(name.into())
 }
 
 fn normalize_event_type(event_type: &str) -> Result<String, String> {

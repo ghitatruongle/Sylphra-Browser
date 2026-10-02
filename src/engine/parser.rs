@@ -2,7 +2,11 @@ use std::collections::HashMap;
 
 pub const MAX_DOM_DEPTH: usize = 64;
 
+pub const MAX_DOM_NODES: usize = crate::resource_caps::DOM_MAX_NODES;
+
 pub const MAX_HTML_BYTES: usize = 10 * 1024 * 1024;
+
+pub type Attributes = HashMap<crate::string_pool::InternedString, String>;
 
 pub const MAX_ATTRS_PER_ELEMENT: usize = 128;
 pub const MAX_ATTR_NAME_LEN: usize = 128;
@@ -14,8 +18,8 @@ pub const MAX_RAW_TEXT_LEN: usize = 2 * 1024 * 1024;
 pub struct Element {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<u64>,
-    pub tag: String,
-    pub attrs: HashMap<String, String>,
+    pub tag: crate::string_pool::InternedString,
+    pub attrs: Attributes,
     pub children: Vec<Element>,
     pub text: String,
 
@@ -26,7 +30,7 @@ impl Element {
     pub fn new(tag: &str) -> Self {
         Element {
             node_id: None,
-            tag: tag.to_string(),
+            tag: crate::string_pool::InternedString::new(tag),
             attrs: HashMap::new(),
             children: Vec::new(),
             text: String::new(),
@@ -35,7 +39,10 @@ impl Element {
     }
 
     pub fn add_attr(&mut self, key: &str, value: &str) {
-        self.attrs.insert(key.to_string(), value.to_string());
+        self.attrs.insert(
+            crate::string_pool::InternedString::new(key),
+            value.to_string(),
+        );
     }
 
     pub fn get_attr(&self, key: &str) -> Option<&String> {
@@ -310,10 +317,11 @@ pub fn parse_html(html: &str) -> Element {
     stack.push(root);
 
     let mut pos = 0;
+    let mut element_count = 0_usize;
     let chars: Vec<char> = html.chars().collect();
     let len = chars.len();
 
-    while pos < len {
+    while pos < len && element_count < MAX_DOM_NODES {
         if chars[pos] == '<' {
             if pos + 1 < len && chars[pos + 1] == '/' {
                 pos += 2;
@@ -374,13 +382,6 @@ pub fn parse_html(html: &str) -> Element {
                             pos = len;
                         }
                     }
-                } else if chars_match_ci_at(&chars, pos, "<!doctype") {
-                    while pos < len && chars[pos] != '>' {
-                        pos += 1;
-                    }
-                    if pos < len {
-                        pos += 1;
-                    }
                 } else {
                     while pos < len && chars[pos] != '>' {
                         pos += 1;
@@ -427,6 +428,7 @@ pub fn parse_html(html: &str) -> Element {
                 }
 
                 let mut elem = Element::new(&tag_name);
+                element_count += 1;
 
                 let is_raw = is_raw_text_tag(&tag_name);
 
@@ -652,7 +654,7 @@ pub fn parse_html(html: &str) -> Element {
     if root.children.len() == 1 && root.text.is_empty() {
         root.children.remove(0)
     } else {
-        root.tag = "html".to_string();
+        root.tag = "html".into();
         root
     }
 }

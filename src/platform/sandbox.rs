@@ -1,8 +1,10 @@
 use crate::process_architecture::{ProcessId, ProcessRole};
+use crate::resource_caps;
 
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     pub memory_limit_bytes: usize,
+    pub job_memory_limit_bytes: usize,
     pub ui_restrictions: bool,
     pub kill_on_job_close: bool,
     pub allowed_origin: Option<String>,
@@ -10,36 +12,15 @@ pub struct SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn default_for_role(role: &ProcessRole) -> Self {
-        match role {
-            ProcessRole::Renderer { origin } => Self {
-                memory_limit_bytes: 512 * 1024 * 1024,
-                ui_restrictions: true,
-                kill_on_job_close: true,
-                allowed_origin: Some(origin.clone()),
-            },
-            ProcessRole::Network => Self {
-                memory_limit_bytes: 256 * 1024 * 1024,
-                ui_restrictions: true,
-                kill_on_job_close: true,
-                allowed_origin: None,
-            },
-            ProcessRole::Media => Self {
-                memory_limit_bytes: 512 * 1024 * 1024,
-                ui_restrictions: true,
-                kill_on_job_close: true,
-                allowed_origin: None,
-            },
-            ProcessRole::Gpu => Self {
-                memory_limit_bytes: 1024 * 1024 * 1024,
-                ui_restrictions: false,
-                kill_on_job_close: true,
-                allowed_origin: None,
-            },
-            ProcessRole::Browser => Self {
-                memory_limit_bytes: 2048 * 1024 * 1024,
-                ui_restrictions: false,
-                kill_on_job_close: false,
-                allowed_origin: None,
+        let memory_limit_bytes = role.memory_limit_bytes();
+        Self {
+            job_memory_limit_bytes: resource_caps::job_memory_limit_bytes(memory_limit_bytes),
+            memory_limit_bytes,
+            ui_restrictions: role.enforces_ui_restrictions(),
+            kill_on_job_close: !matches!(role, ProcessRole::Browser),
+            allowed_origin: match role {
+                ProcessRole::Renderer { origin } => Some(origin.clone()),
+                _ => None,
             },
         }
     }
@@ -195,7 +176,7 @@ fn create_native_job(policy: &SandboxPolicy) -> Result<windows::Win32::Foundatio
         limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     }
     limits.BasicLimitInformation.ActiveProcessLimit = 1;
-    limits.ProcessMemoryLimit = policy.memory_limit_bytes;
+    limits.ProcessMemoryLimit = policy.job_memory_limit_bytes;
     if let Err(error) = unsafe {
         SetInformationJobObject(
             job,

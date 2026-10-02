@@ -1150,7 +1150,7 @@ impl<'a> RuntimeHost<'a> {
 
     fn element_tag(&self, node: NodeId) -> Option<String> {
         match &self.dom.node(node)?.kind {
-            crate::live_dom::LiveNodeKind::Element { tag, .. } => Some(tag.clone()),
+            crate::live_dom::LiveNodeKind::Element { tag, .. } => Some(tag.to_string()),
             crate::live_dom::LiveNodeKind::Text(_) => None,
         }
     }

@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 use crate::paint::Rgba;
 use crate::scene_compositor::{CompositedFrame, OptionalGpuAdapter, RetainedScene, ScenePrimitive};
 
-const MAX_GPU_SOURCE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_GPU_SOURCE_BYTES: usize = crate::resource_caps::GPU_SOURCE_AGGREGATE_BYTES;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

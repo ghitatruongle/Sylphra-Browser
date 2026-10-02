@@ -102,3 +102,49 @@ fn sleep_wake_and_discard_keep_the_restore_contract() {
         Some("https://restore.test/page".to_string())
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn a_twenty_tab_session_is_bounded_by_measured_ram() {
+    use sylphra::memory_probe;
+
+    let mut browser = Browser::new_in_memory();
+    let html = format!(
+        "<main><h1>Measured fixture</h1>{}</main>",
+        (0..400)
+            .map(|index| format!("<p>measured row {index} stays inside the budget</p>"))
+            .collect::<String>()
+    );
+    for index in 0..20 {
+        browser.add_tab(
+            &format!("https://measured{index}.test/page"),
+            parse_html(&html),
+            &format!("Measured {index}"),
+        );
+        if let Some(tab) = browser.active_tab_mut() {
+            tab.last_active_timestamp -= 7_200 + index as i64;
+        }
+    }
+
+    let before = memory_probe::sample();
+    assert!(before.process_working_set_bytes > MB as u64);
+    assert!(before.system.total_bytes > before.system.available_bytes);
+
+    browser.sync_tab_budgets();
+    let budget = browser.memory_budget();
+    assert!(browser.resources.aggregate_bytes() <= budget.hard_limit_bytes);
+    let estimate = browser.estimate_memory().total_bytes;
+    assert!(estimate > 0);
+
+    let tight = MemoryBudget::from_bytes(estimate / 4, estimate / 3);
+    let report = browser.relieve_memory_pressure(tight, 2);
+    assert!(report.measured_working_set_bytes > 0);
+    assert!(report.system_available_bytes > 0);
+    assert!(report.level.relief_required());
+
+    let after = memory_probe::sample();
+    assert!(after.process_working_set_bytes > 0);
+    assert!(report.after_bytes < report.before_bytes);
+    assert!(browser.resources.aggregate_bytes() <= budget.hard_limit_bytes);
+    assert!(browser.estimate_memory().total_bytes < report.before_bytes);
+}

@@ -256,12 +256,14 @@ impl CompoundSelector {
         }
 
         for attr in &self.attributes {
-            let actual = match ctx.attrs.get(&attr.name.to_ascii_lowercase()) {
+            let lowered = attr.name.to_ascii_lowercase();
+            let actual = match ctx
+                .attrs
+                .get(lowered.as_str())
+                .or_else(|| ctx.attrs.get(attr.name.as_str()))
+            {
                 Some(v) => v.as_str(),
-                None => match ctx.attrs.get(&attr.name) {
-                    Some(v) => v.as_str(),
-                    None => return false,
-                },
+                None => return false,
             };
 
             let matches = match attr.operator {
@@ -479,7 +481,7 @@ pub struct ElementMatchingContext<'a> {
     pub tag: &'a str,
     pub classes: &'a [String],
     pub id: Option<&'a str>,
-    pub attrs: &'a HashMap<String, String>,
+    pub attrs: &'a crate::parser::Attributes,
     pub is_root: bool,
     pub ancestors: &'a [ElementAncestry],
     pub index_in_parent: usize,
@@ -504,7 +506,7 @@ impl<'a> ElementMatchingContext<'a> {
         tag: &'a str,
         classes: &'a [String],
         id: Option<&'a str>,
-        attrs: &'a HashMap<String, String>,
+        attrs: &'a crate::parser::Attributes,
         is_root: bool,
         ancestors: &'a [ElementAncestry],
     ) -> Self {
@@ -539,7 +541,7 @@ impl<'a> ElementMatchingContext<'a> {
         tag: &'a str,
         classes: &'a [String],
         id: Option<&'a str>,
-        attrs: &'a HashMap<String, String>,
+        attrs: &'a crate::parser::Attributes,
         is_root: bool,
         ancestors: &'a [ElementAncestry],
         siblings: &'a SiblingContext,
@@ -643,7 +645,7 @@ impl Selector {
         tag: &str,
         classes: &[String],
         elem_id: Option<&str>,
-        attrs: &HashMap<String, String>,
+        attrs: &crate::parser::Attributes,
     ) -> bool {
         self.matches_element(tag, classes, elem_id, attrs, false, &[])
     }
@@ -653,7 +655,7 @@ impl Selector {
         tag: &str,
         classes: &[String],
         elem_id: Option<&str>,
-        attrs: &HashMap<String, String>,
+        attrs: &crate::parser::Attributes,
         is_root: bool,
         ancestry: &[ElementAncestry],
     ) -> bool {
@@ -777,7 +779,7 @@ impl Selector {
         tag: &str,
         classes: &[String],
         elem_id: Option<&str>,
-        attrs: &HashMap<String, String>,
+        attrs: &crate::parser::Attributes,
         is_root: bool,
         ancestry: &[ElementAncestry],
     ) -> bool {
@@ -826,7 +828,7 @@ impl Selector {
         tag: &str,
         classes: &[String],
         elem_id: Option<&str>,
-        attrs: &HashMap<String, String>,
+        attrs: &crate::parser::Attributes,
     ) -> bool {
         if let Some(ref sel_tag) = self.tag {
             if sel_tag != "*" && !sel_tag.eq_ignore_ascii_case(tag) {
@@ -845,12 +847,13 @@ impl Selector {
             }
         }
         for (attr_name, attr_val) in &self.attributes {
-            let actual = match attrs.get(attr_name) {
+            let lowered = attr_name.to_ascii_lowercase();
+            let actual = match attrs
+                .get(attr_name.as_str())
+                .or_else(|| attrs.get(lowered.as_str()))
+            {
                 Some(v) => v,
-                None => match attrs.get(&attr_name.to_ascii_lowercase()) {
-                    Some(v) => v,
-                    None => return false,
-                },
+                None => return false,
             };
             if !attr_val.is_empty() && actual != attr_val {
                 return false;
@@ -1439,12 +1442,12 @@ fn parse_selector_list(input: &str) -> Vec<Selector> {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ElementAncestry {
-    pub tag: String,
+    pub tag: crate::string_pool::InternedString,
     pub classes: Vec<String>,
     pub id: Option<String>,
 
     #[serde(default)]
-    pub attrs: HashMap<String, String>,
+    pub attrs: crate::parser::Attributes,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2497,11 +2500,7 @@ fn resolve_var_recursive(
             None => (body.trim(), None),
         };
 
-        if !name.starts_with("--") {
-            let fb = fallback?;
-            let expanded = resolve_var_recursive(fb, customs, visited, depth + 1)?;
-            output.push_str(&expanded);
-        } else if visited.contains(name) {
+        if !name.starts_with("--") || visited.contains(name) {
             let fb = fallback?;
             let expanded = resolve_var_recursive(fb, customs, visited, depth + 1)?;
             output.push_str(&expanded);
@@ -3226,8 +3225,8 @@ fn parse_css_with_context(
         return Vec::new();
     }
 
-    let css = if css.len() > 10_000_000 {
-        &css[..10_000_000]
+    let css = if css.len() > crate::resource_caps::CSS_MAX_SOURCE_BYTES {
+        &css[..crate::resource_caps::CSS_MAX_SOURCE_BYTES]
     } else {
         css
     };
@@ -3244,7 +3243,7 @@ fn parse_css_with_context(
     let mut pos = 0;
     let mut source_order = 0;
 
-    while pos < len {
+    while pos < len && rules.len() < crate::resource_caps::CSS_MAX_RULES {
         while pos < len && chars[pos].is_whitespace() {
             pos += 1;
         }
@@ -3497,6 +3496,7 @@ fn parse_css_with_context(
         }
     }
 
+    rules.truncate(crate::resource_caps::CSS_MAX_RULES);
     rules
 }
 
@@ -3637,7 +3637,7 @@ pub fn compute_computed_style(
     element_id: Option<&str>,
     rules: &[CssRule],
     parent_style: Option<&ComputedStyle>,
-    element_attrs: &HashMap<String, String>,
+    element_attrs: &crate::parser::Attributes,
 ) -> ComputedStyle {
     let is_root =
         element_tag.eq_ignore_ascii_case("html") || element_tag.eq_ignore_ascii_case(":root");
@@ -3660,7 +3660,7 @@ pub fn compute_computed_style_with_ancestors(
     element_id: Option<&str>,
     rules: &[CssRule],
     parent_style: Option<&ComputedStyle>,
-    element_attrs: &HashMap<String, String>,
+    element_attrs: &crate::parser::Attributes,
     is_root: bool,
     ancestry: &[ElementAncestry],
 ) -> ComputedStyle {
@@ -3684,7 +3684,7 @@ pub fn compute_computed_style_full(
     element_id: Option<&str>,
     rules: &[CssRule],
     parent_style: Option<&ComputedStyle>,
-    element_attrs: &HashMap<String, String>,
+    element_attrs: &crate::parser::Attributes,
     is_root: bool,
     ancestry: &[ElementAncestry],
     siblings: &SiblingContext,
@@ -4148,11 +4148,11 @@ mod tests {
             vec![("type".to_string(), "text".to_string())]
         );
 
-        let mut attrs = HashMap::new();
-        attrs.insert("type".to_string(), "text".to_string());
+        let mut attrs = crate::parser::Attributes::new();
+        attrs.insert("type".into(), "text".to_string());
         assert!(sel.matches("input", &[], None, &attrs));
 
-        attrs.insert("type".to_string(), "password".to_string());
+        attrs.insert("type".into(), "password".to_string());
         assert!(!sel.matches("input", &[], None, &attrs));
 
         attrs.remove("type");
@@ -4162,9 +4162,9 @@ mod tests {
     #[test]
     fn test_attribute_presence_selector() {
         let sel = Selector::parse("[disabled]");
-        let mut attrs = HashMap::new();
+        let mut attrs = crate::parser::Attributes::new();
         assert!(!sel.matches("input", &[], None, &attrs));
-        attrs.insert("disabled".to_string(), String::new());
+        attrs.insert("disabled".into(), String::new());
         assert!(sel.matches("input", &[], None, &attrs));
     }
 
@@ -4414,8 +4414,8 @@ mod tests {
     #[test]
     fn test_pseudo_classes_and_attributes() {
         let sel = Selector::parse("button.btn[type^='sub']:hover:not([disabled])");
-        let mut attrs = HashMap::new();
-        attrs.insert("type".to_string(), "submit".to_string());
+        let mut attrs = crate::parser::Attributes::new();
+        attrs.insert("type".into(), "submit".to_string());
         let classes = vec!["btn".to_string()];
         let ctx = ElementMatchingContext {
             tag: "button",
@@ -4441,9 +4441,9 @@ mod tests {
         };
         assert!(sel.matches_context(&ctx));
 
-        let mut disabled_attrs = HashMap::new();
-        disabled_attrs.insert("type".to_string(), "submit".to_string());
-        disabled_attrs.insert("disabled".to_string(), "".to_string());
+        let mut disabled_attrs = crate::parser::Attributes::new();
+        disabled_attrs.insert("type".into(), "submit".to_string());
+        disabled_attrs.insert("disabled".into(), "".to_string());
         let disabled_ctx = ElementMatchingContext {
             tag: "button",
             classes: &classes,

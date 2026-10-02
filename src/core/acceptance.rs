@@ -763,23 +763,4 @@ fn validate_freshness(timestamp: u64, now: u64, name: &str, failures: &mut Vec<S
     }
 }
 
-#[cfg(target_os = "windows")]
-pub fn current_process_working_set_bytes() -> Result<u64, String> {
-    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(counters.WorkingSetSize as u64)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn current_process_working_set_bytes() -> Result<u64, String> {
-    Err("working-set measurement is only implemented on Windows".into())
-}
+pub use crate::memory_probe::current_process_working_set_bytes;

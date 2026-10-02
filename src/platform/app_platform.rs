@@ -494,7 +494,7 @@ impl ApplicationDocument {
         let LiveNodeKind::Element { tag, .. } = &self.document.node(node)?.kind else {
             return None;
         };
-        Some(tag.clone())
+        Some(tag.to_string())
     }
 
     fn is_connected(&self, node: NodeId) -> bool {

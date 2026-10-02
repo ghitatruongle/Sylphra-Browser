@@ -1,12 +1,13 @@
-use std::collections::HashMap;
 use sylphra::css_parser::{
     compute_computed_style, compute_computed_style_with_ancestors, parse_css, parse_css_with_media,
     ElementAncestry,
 };
+use sylphra::parser::Attributes;
+use sylphra::string_pool::InternedString;
 
-fn attrs(map: &[(&str, &str)]) -> HashMap<String, String> {
+fn attrs(map: &[(&str, &str)]) -> Attributes {
     map.iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (InternedString::new(k), v.to_string()))
         .collect()
 }
 
@@ -103,13 +104,13 @@ fn descendant_and_child_combinators_match_against_ancestry() {
     );
     let ancestry = vec![
         ElementAncestry {
-            tag: "nav".to_string(),
+            tag: "nav".into(),
             classes: vec![],
             id: None,
             attrs: Default::default(),
         },
         ElementAncestry {
-            tag: "body".to_string(),
+            tag: "body".into(),
             classes: vec![],
             id: None,
             attrs: Default::default(),
@@ -148,7 +149,7 @@ fn descendant_and_child_combinators_match_against_ancestry() {
         &attrs(&[]),
         false,
         &[ElementAncestry {
-            tag: "ul".to_string(),
+            tag: "ul".into(),
             classes: vec!["menu".to_string()],
             id: None,
             attrs: Default::default(),
@@ -165,7 +166,7 @@ fn descendant_and_child_combinators_match_against_ancestry() {
         &attrs(&[]),
         false,
         &[ElementAncestry {
-            tag: "div".to_string(),
+            tag: "div".into(),
             classes: vec![],
             id: Some("app".to_string()),
             attrs: Default::default(),

@@ -5,6 +5,15 @@ use sylphra::css_parser::{
     record_unsupported_property, reset_css_diagnostics, supports_query_matches, CssUnit,
     ElementAncestry, ElementMatchingContext, Selector,
 };
+use sylphra::parser::Attributes;
+use sylphra::string_pool::InternedString;
+
+fn intern_map(pairs: &[(&str, &str)]) -> Attributes {
+    pairs
+        .iter()
+        .map(|(name, value)| (InternedString::new(name), value.to_string()))
+        .collect()
+}
 
 #[test]
 fn test_compound_selector_and_specificity() {
@@ -36,17 +45,15 @@ fn test_attribute_operators_and_case_sensitivity() {
     let sel_dash = Selector::parse("[lang|='en']");
     let sel_case_i = Selector::parse("[title='example' i]");
 
-    let mut attrs = HashMap::new();
-    attrs.insert("data-role".to_string(), "admin".to_string());
-    attrs.insert("href".to_string(), "https://github.com".to_string());
-    attrs.insert("src".to_string(), "logo.png".to_string());
-    attrs.insert("class".to_string(), "large btn-primary action".to_string());
-    attrs.insert(
-        "rel".to_string(),
-        "noopener nofollow noreferrer".to_string(),
-    );
-    attrs.insert("lang".to_string(), "en-US".to_string());
-    attrs.insert("title".to_string(), "EXAMPLE".to_string());
+    let attrs = intern_map(&[
+        ("data-role", "admin"),
+        ("href", "https://github.com"),
+        ("src", "logo.png"),
+        ("class", "large btn-primary action"),
+        ("rel", "noopener nofollow noreferrer"),
+        ("lang", "en-US"),
+        ("title", "EXAMPLE"),
+    ]);
 
     assert!(sel_exact.matches("div", &[], None, &attrs));
     assert!(sel_prefix.matches("a", &[], None, &attrs));
@@ -68,8 +75,7 @@ fn test_pseudo_classes_evaluation() {
         ElementMatchingContext::simple("button", &[], None, &enabled_attrs, false, &[]);
     assert!(sel_not.matches_context(&enabled_ctx));
 
-    let mut disabled_attrs = HashMap::new();
-    disabled_attrs.insert("disabled".to_string(), "".to_string());
+    let disabled_attrs = intern_map(&[("disabled", "")]);
     let disabled_ctx =
         ElementMatchingContext::simple("button", &[], None, &disabled_attrs, false, &[]);
     assert!(!sel_not.matches_context(&disabled_ctx));
@@ -95,13 +101,13 @@ fn test_combinators_child_and_descendant() {
 
     let ancestry = vec![
         ElementAncestry {
-            tag: "ul".to_string(),
+            tag: "ul".into(),
             classes: vec![],
             id: None,
             attrs: Default::default(),
         },
         ElementAncestry {
-            tag: "nav".to_string(),
+            tag: "nav".into(),
             classes: vec![],
             id: None,
             attrs: Default::default(),
@@ -113,19 +119,19 @@ fn test_combinators_child_and_descendant() {
 
     let deep_ancestry = vec![
         ElementAncestry {
-            tag: "div".to_string(),
+            tag: "div".into(),
             classes: vec!["wrapper".to_string()],
             id: None,
             attrs: Default::default(),
         },
         ElementAncestry {
-            tag: "section".to_string(),
+            tag: "section".into(),
             classes: vec![],
             id: None,
             attrs: Default::default(),
         },
         ElementAncestry {
-            tag: "article".to_string(),
+            tag: "article".into(),
             classes: vec![],
             id: None,
             attrs: Default::default(),
@@ -356,8 +362,7 @@ fn test_wikipedia_sample_stylesheet() {
     let root_style = compute_computed_style("html", &[], None, &rules, None, &HashMap::new());
     assert!(root_style.custom_properties.contains_key("--color-base"));
 
-    let mut attrs = HashMap::new();
-    attrs.insert("href".to_string(), "/wiki/Rust".to_string());
+    let attrs = intern_map(&[("href", "/wiki/Rust")]);
     let link_style = compute_computed_style("a", &[], None, &rules, Some(&root_style), &attrs);
     assert_eq!(link_style.color.as_deref(), Some("#3366cc"));
 
@@ -515,9 +520,7 @@ fn ancestor_attribute_selectors_match_against_real_attrs() {
         tag: "form".into(),
         classes: Vec::new(),
         id: None,
-        attrs: [("action".to_string(), "/submit".to_string())]
-            .into_iter()
-            .collect(),
+        attrs: intern_map(&[("action", "/submit")]),
     }];
     let style = compute_computed_style_with_ancestors(
         "input", &classes, None, &rules, None, &attrs, false, &ancestry,

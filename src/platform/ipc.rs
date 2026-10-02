@@ -1,16 +1,98 @@
 use crate::process_architecture::{GenerationId, ProcessId};
 
 pub const IPC_VERSION: u32 = 1;
-pub const MAX_IPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_IPC_MESSAGE_BYTES: usize = crate::resource_caps::IPC_MESSAGE_BYTES;
+pub const MAX_IPC_CHUNK_BYTES: usize = crate::resource_caps::IPC_CHUNK_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RenderPart {
+    Styles,
+    Html,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IpcCommand {
-    Navigate { url: String },
-    RenderFrame { html: String },
-    FetchResource { url: String, method: String },
-    PlayMedia { src: String },
+    Navigate {
+        url: String,
+    },
+    RenderFrame {
+        html: String,
+    },
+    FetchResource {
+        url: String,
+        method: String,
+    },
+    PlayMedia {
+        src: String,
+    },
     Heartbeat,
     Shutdown,
+    MemoryStress {
+        bytes: u64,
+    },
+    RenderBegin {
+        tab_id: u64,
+        generation: u64,
+        style_bytes: u64,
+        html_bytes: u64,
+        viewport_width: u32,
+        viewport_height: u32,
+    },
+    RenderChunk {
+        seq: u64,
+        part: RenderPart,
+        text: String,
+    },
+    RenderEnd {
+        seq: u64,
+    },
+    DomBegin {
+        tab_id: u64,
+        generation: u64,
+        node_count: u64,
+        total_bytes: u64,
+    },
+    DomChunk {
+        seq: u64,
+        text: String,
+    },
+    DomEnd {
+        seq: u64,
+    },
+    DomRequest {
+        tab_id: u64,
+        seq: u64,
+    },
+    MemoryReport {
+        working_set_bytes: u64,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum IpcReplyBody {
+    #[default]
+    Idle,
+    DomAck {
+        next_seq: u64,
+    },
+    DomBegin {
+        tab_id: u64,
+        node_count: u64,
+        total_bytes: u64,
+    },
+    DomChunk {
+        seq: u64,
+        text: String,
+    },
+    DomEnd {
+        seq: u64,
+    },
+    Memory {
+        working_set_bytes: u64,
+    },
+    Rejected {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -32,6 +114,31 @@ pub struct NativeIpcReply {
     pub sequence: u64,
     pub accepted: bool,
     pub detail: String,
+    #[serde(default)]
+    pub body: IpcReplyBody,
+}
+
+pub fn split_text_chunks(text: &str, limit: usize) -> Vec<String> {
+    if limit == 0 || text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut current = 0usize;
+    for (offset, ch) in text.char_indices() {
+        let width = ch.len_utf8();
+        if current + width > limit && current > 0 {
+            chunks.push(text[start..offset].to_string());
+            start = offset;
+            current = width;
+        } else {
+            current += width;
+        }
+    }
+    if start < text.len() {
+        chunks.push(text[start..].to_string());
+    }
+    chunks
 }
 
 pub struct IpcChannel {
@@ -151,6 +258,20 @@ impl IpcChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunks_never_split_a_multibyte_character() {
+        let source = "漢".repeat(400);
+        let chunks = split_text_chunks(&source, 1_000);
+        assert!(chunks.len() > 1);
+        let rejoined = chunks.concat();
+        assert_eq!(rejoined, source);
+        for chunk in &chunks {
+            assert!(chunk.len() <= 1_000);
+        }
+        assert!(split_text_chunks("", 10).is_empty());
+        assert!(split_text_chunks("abc", 0).is_empty());
+    }
 
     #[test]
     fn ipc_channel_version_and_generation_checking() {

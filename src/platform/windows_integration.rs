@@ -280,18 +280,11 @@ impl WindowsIntegration {
             "Software\\Classes\\Sylphra.Text",
             "Software\\Classes\\Sylphra.HTTP",
             "Software\\Classes\\Sylphra.HTTPS",
-            "Software\\Clients\\StartMenuInternet\\GhitaBrowser",
-            "Software\\Classes\\GhitaBrowser.HTML",
-            "Software\\Classes\\GhitaBrowser.PDF",
-            "Software\\Classes\\GhitaBrowser.Text",
-            "Software\\Classes\\GhitaBrowser.HTTP",
-            "Software\\Classes\\GhitaBrowser.HTTPS",
         ] {
             let wide = wide_null(path);
             let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide.as_ptr())) };
         }
         delete_hkcu_value("Software\\RegisteredApplications", "Sylphra")?;
-        let _ = delete_hkcu_value("Software\\RegisteredApplications", "GhitaBrowser");
         notify_association_change();
         Ok(())
     }

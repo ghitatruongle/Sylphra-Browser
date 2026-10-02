@@ -4,6 +4,7 @@ mod hardening;
 mod installed_app;
 mod multiprocess_ipc;
 mod permissions;
+mod renderer_process_ram;
 mod sandbox_isolation;
 mod security_compatibility;
 mod updater;

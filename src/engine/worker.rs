@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 use crate::css_parser::CssRule;
 use crate::document::PreparedDocument;
 
-pub const MAX_WORKER_REQUEST_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_WORKER_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_WORKER_REQUEST_BYTES: usize = crate::resource_caps::WORKER_REQUEST_BYTES;
+pub const MAX_WORKER_RESPONSE_BYTES: usize = crate::resource_caps::WORKER_RESPONSE_BYTES;
 pub const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_WORKER_STDERR_BYTES: u64 = 64 * 1024;
 const PDF_REQUEST_MAGIC: &[u8; 8] = b"GHPDF001";
 const COMPRESSED_PAYLOAD_MAGIC: &[u8; 8] = b"GHZ10001";
 const COMPRESSION_THRESHOLD: usize = 64 * 1024;
 #[cfg(windows)]
-const WORKER_PROCESS_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+const WORKER_PROCESS_MEMORY_LIMIT: usize = crate::resource_caps::WORKER_PROCESS_MEMORY_BYTES;
 
 struct ChildGuard(std::process::Child);
 
@@ -612,7 +612,7 @@ fn encode_wire_payload(payload: &[u8], limit: usize) -> Result<Vec<u8>, WorkerEr
     Ok(wire)
 }
 
-fn decode_wire_payload(payload: Vec<u8>, limit: usize) -> Result<Vec<u8>, WorkerError> {
+pub fn decode_wire_payload(payload: Vec<u8>, limit: usize) -> Result<Vec<u8>, WorkerError> {
     if !payload.starts_with(COMPRESSED_PAYLOAD_MAGIC) {
         if payload.len() > limit {
             return Err(WorkerError::Protocol(format!(

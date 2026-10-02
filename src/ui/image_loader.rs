@@ -4,6 +4,9 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::resource_caps;
+use crate::resource_ledger::{OwnerId, ResourceLedger, SubsystemId};
+
 #[derive(Debug, Clone)]
 pub struct ImageData {
     pub url: String,
@@ -369,18 +372,21 @@ pub fn fetch_and_decode_image(url: &str) -> anyhow::Result<ImageData> {
             .build();
         let response = agent.get(url).call()?;
 
-        const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+        const MAX_IMAGE_BYTES: u64 = resource_caps::IMAGE_DOWNLOAD_BYTES;
         let mut bytes = Vec::new();
         response
             .into_reader()
             .take(MAX_IMAGE_BYTES + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            return Err(anyhow::anyhow!("Image exceeds the 50MB download limit"));
+            return Err(anyhow::anyhow!(
+                "Image exceeds the {}MB download limit",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
         }
         bytes
     } else if let Some(path) = url.strip_prefix("file://") {
-        const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+        const MAX_IMAGE_BYTES: u64 = resource_caps::IMAGE_DOWNLOAD_BYTES;
 
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|error| anyhow::anyhow!("Cannot stat local image: {error}"))?;
@@ -394,7 +400,10 @@ pub fn fetch_and_decode_image(url: &str) -> anyhow::Result<ImageData> {
         let mut bytes = Vec::new();
         file.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            return Err(anyhow::anyhow!("Image exceeds the 50MB download limit"));
+            return Err(anyhow::anyhow!(
+                "Image exceeds the {}MB download limit",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
         }
         bytes
     } else {
@@ -428,22 +437,12 @@ pub async fn fetch_and_decode_image_async(url: &str) -> anyhow::Result<ImageData
 }
 
 fn decode_image_bytes(url: &str, bytes: Vec<u8>) -> anyhow::Result<ImageData> {
-    let dims = image::io::Reader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
-    let (w, h) = dims.into_dimensions()?;
-    const MAX_IMAGE_DIMENSION: u32 = 8192;
-
-    const MAX_IMAGE_PIXELS: u64 = 16_777_216;
-    if w > MAX_IMAGE_DIMENSION
-        || h > MAX_IMAGE_DIMENSION
-        || (w as u64) * (h as u64) > MAX_IMAGE_PIXELS
-    {
-        return Err(anyhow::anyhow!(
-            "Image dimensions {}x{} exceed the {}px limit",
-            w,
-            h,
-            MAX_IMAGE_DIMENSION
-        ));
-    }
+    let header = image::io::Reader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
+    let (w, h) = header.into_dimensions()?;
+    let decoded_bytes = decoded_buffer_bytes(w, h)?;
+    let _decode_budget = ResourceLedger::shared()
+        .lease(SubsystemId::ImageCache, OwnerId::Global, decoded_bytes)
+        .map_err(|denied| anyhow::anyhow!(denied.message()))?;
 
     let img = image::io::Reader::new(std::io::Cursor::new(&bytes))
         .with_guessed_format()?
@@ -466,6 +465,29 @@ fn decode_image_bytes(url: &str, bytes: Vec<u8>) -> anyhow::Result<ImageData> {
         rgba_pixels: pixels,
         format,
     })
+}
+
+pub fn decoded_buffer_bytes(width: u32, height: u32) -> anyhow::Result<usize> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width > resource_caps::IMAGE_MAX_EDGE_PX || height > resource_caps::IMAGE_MAX_EDGE_PX {
+        return Err(anyhow::anyhow!(
+            "Image dimensions {width}x{height} exceed the {}px edge limit",
+            resource_caps::IMAGE_MAX_EDGE_PX
+        ));
+    }
+    if pixels > resource_caps::IMAGE_MAX_PIXELS {
+        return Err(anyhow::anyhow!(
+            "Image of {width}x{height} exceeds the {} pixel decode limit",
+            resource_caps::IMAGE_MAX_PIXELS
+        ));
+    }
+    let bytes = pixels.saturating_mul(resource_caps::IMAGE_BYTES_PER_PIXEL);
+    if bytes > resource_caps::IMAGE_DECODED_BYTES as u64 {
+        return Err(anyhow::anyhow!(
+            "Image of {width}x{height} needs a larger decode buffer than the budget allows"
+        ));
+    }
+    Ok(bytes as usize)
 }
 
 #[cfg(test)]

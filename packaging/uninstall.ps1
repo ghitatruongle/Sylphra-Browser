@@ -1,17 +1,14 @@
 $ErrorActionPreference = "Stop"
 
 $destinations = @(
-    "$env:LOCALAPPDATA\Programs\Sylphra",
-    "$env:LOCALAPPDATA\Programs\GhitaBrowser"
+    "$env:LOCALAPPDATA\Programs\Sylphra"
 )
 $desktop = [Environment]::GetFolderPath("Desktop")
 $links = @(
-    (Join-Path $desktop "Sylphra.lnk"),
-    (Join-Path $desktop "GhitaBrowser.lnk")
+    (Join-Path $desktop "Sylphra.lnk")
 )
 $startMenus = @(
-    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Sylphra.lnk",
-    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\GhitaBrowser.lnk"
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Sylphra.lnk"
 )
 
 foreach ($dest in $destinations) {

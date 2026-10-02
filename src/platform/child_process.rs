@@ -314,29 +314,67 @@ impl ChildProcessManager {
     }
 }
 
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    loop {
+        let mut line: Vec<u8> = Vec::new();
+        let mut oversized = false;
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if oversized || line.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            if let Some(newline) = available.iter().position(|&byte| byte == b'\n') {
+                if !oversized {
+                    line.extend_from_slice(&available[..newline]);
+                    if line.len() > max_bytes {
+                        oversized = true;
+                        line = Vec::new();
+                    }
+                }
+                reader.consume(newline + 1);
+                break;
+            }
+            if !oversized {
+                line.extend_from_slice(available);
+                if line.len() > max_bytes {
+                    oversized = true;
+                    line = Vec::new();
+                }
+            }
+            let chunk = available.len();
+            reader.consume(chunk);
+        }
+        if oversized {
+            continue;
+        }
+        return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+    }
+}
+
 fn spawn_reply_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
     let (sender, receiver) = mpsc::channel();
 
-    if std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("native-child-ipc-reader".into())
         .spawn(move || {
-            use std::io::Read;
-            let reader = BufReader::new(stdout);
-            let mut inner = reader.take((crate::ipc::MAX_IPC_MESSAGE_BYTES + 1) as u64);
+            let mut reader = BufReader::new(stdout);
             loop {
-                let mut line = String::new();
-                match inner.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
+                match read_bounded_line(&mut reader, crate::ipc::MAX_IPC_MESSAGE_BYTES) {
+                    Ok(Some(line)) => {
                         if sender.send(line).is_err() {
                             break;
                         }
                     }
+                    Ok(None) | Err(_) => break,
                 }
             }
-        })
-        .is_err()
-    {}
+        });
     receiver
 }
 
@@ -420,5 +458,48 @@ mod tests {
             cpm.processes.get(&pid).unwrap().state,
             ProcessState::Running
         );
+    }
+
+    fn collect_lines(stream: &[u8], max_bytes: usize) -> Vec<String> {
+        use std::io::Cursor;
+        let mut reader = BufReader::new(Cursor::new(stream.to_vec()));
+        let mut received = Vec::new();
+        while let Ok(Some(line)) = read_bounded_line(&mut reader, max_bytes) {
+            received.push(line);
+        }
+        received
+    }
+
+    #[test]
+    fn reply_reader_survives_more_total_bytes_than_one_message_cap() {
+        let chunk = "x".repeat(600_000);
+        let mut stream = String::new();
+        for _ in 0..8 {
+            stream.push_str(&chunk);
+            stream.push('\n');
+        }
+        stream.push_str("{\"accepted\":true}\n");
+        let received = collect_lines(stream.as_bytes(), crate::ipc::MAX_IPC_MESSAGE_BYTES);
+        assert_eq!(received.len(), 9);
+        assert_eq!(received[8], "{\"accepted\":true}");
+    }
+
+    #[test]
+    fn oversized_reply_line_is_skipped_without_killing_the_stream() {
+        let oversized = "y".repeat(crate::ipc::MAX_IPC_MESSAGE_BYTES + 1);
+        let stream = format!("{oversized}\nsmall\n");
+        let received = collect_lines(stream.as_bytes(), crate::ipc::MAX_IPC_MESSAGE_BYTES);
+        assert_eq!(received, vec!["small".to_string()]);
+    }
+
+    #[test]
+    fn final_reply_without_newline_is_delivered() {
+        let received = collect_lines(b"alpha\nbeta", 1024);
+        assert_eq!(received, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn empty_reply_stream_yields_no_lines() {
+        assert!(collect_lines(b"", 1024).is_empty());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "sylphra"
-version = "0.0.0-alpha"
+version = "0.0.0-beta1"
 edition = "2021"
 authors = ["Sylphra"]
 description = "A lightweight document-focused browser written in safe Rust"
@@ -11,6 +11,10 @@ repository = "https://github.com/ghitatruongle/Sylphra-Browser"
 readme = "README.md"
 keywords = ["browser", "html", "css", "rust", "windows"]
 categories = ["gui", "web-programming"]
+
+[features]
+default = []
+renderer-memory-harness = []
 
 [dependencies]
 iced = { version = "0.12", default-features = false, features = ["tokio", "image", "canvas", "system"] }
@@ -63,6 +67,7 @@ windows = { version = "0.52", features = [
     "Win32_System_Threading",
     "Win32_System_Registry",
     "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

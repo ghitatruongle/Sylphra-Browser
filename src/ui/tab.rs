@@ -1,5 +1,7 @@
 use crate::layout::LayoutNode;
 use crate::parser::Element;
+use crate::resource_caps;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -42,20 +44,28 @@ impl HistoryEntry {
             .saturating_add(self.compressed_dom.as_ref().map_or(0, Vec::capacity))
     }
 
+    fn snapshot_bytes(&self) -> usize {
+        self.compressed_dom.as_ref().map_or(0, Vec::capacity)
+    }
+
+    fn release_snapshot(&mut self) {
+        self.compressed_dom = None;
+        self.has_dom = false;
+    }
+
     fn compress_dom(dom: &Element) -> Option<Vec<u8>> {
         if dom.children.is_empty() && dom.tag == "root" {
             return None;
         }
 
-        const MAX_SNAPSHOT_JSON_BYTES: usize = 8 * 1024 * 1024;
-        let json = serde_json::to_vec(dom).ok()?;
-        if json.len() > MAX_SNAPSHOT_JSON_BYTES {
-            log::warn!(
-                "Skipping history DOM snapshot: {} bytes exceeds the cap",
-                json.len()
-            );
-            return None;
-        }
+        const MAX_SNAPSHOT_JSON_BYTES: usize = resource_caps::SNAPSHOT_JSON_RAM_BYTES;
+        let json = match bounded_dom_json(dom, MAX_SNAPSHOT_JSON_BYTES) {
+            Ok(data) => data,
+            Err(error) => {
+                log::warn!("Skipping history DOM snapshot: {error}");
+                return None;
+            }
+        };
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&json).ok()?;
@@ -67,6 +77,37 @@ impl HistoryEntry {
             Some(json)
         }
     }
+}
+
+struct BoundedJsonSink {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for BoundedJsonSink {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(buffer.len()) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("DOM snapshot exceeds the {} byte cap", self.limit),
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_dom_json(dom: &Element, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut sink = BoundedJsonSink {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut sink, dom)?;
+    Ok(sink.bytes)
 }
 
 fn decompress_dom_bytes(data: &[u8]) -> Result<Element, Box<dyn std::error::Error>> {
@@ -174,6 +215,15 @@ fn flatten_deep(root: Element, max_depth: usize) -> Element {
     stack.pop().unwrap_or_else(|| Element::new("html"))
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RetainedBytesCache {
+    dom_bytes: usize,
+    layout_bytes: usize,
+    dom_root_children: usize,
+    layout_present: bool,
+    valid: bool,
+}
+
 #[derive(Debug)]
 pub struct Tab {
     pub id: usize,
@@ -211,6 +261,12 @@ pub struct Tab {
     pub compressed_dom: Option<Vec<u8>>,
 
     pub runtime: Option<crate::web_runtime::PageRuntime>,
+
+    is_disk_backed: bool,
+
+    snapshot_path: Option<String>,
+
+    retained_estimate: Cell<RetainedBytesCache>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -222,7 +278,16 @@ pub enum WakeResult {
     NeedsReload(String),
 }
 
-const MAX_HISTORY_ENTRIES: usize = 60;
+#[derive(Debug, PartialEq)]
+pub enum HistoryNavigation {
+    Moved,
+
+    NeedsReload(String),
+
+    Blocked,
+}
+
+const MAX_HISTORY_ENTRIES: usize = resource_caps::TAB_HISTORY_ENTRY_CAP;
 
 impl Tab {
     pub fn new(id: usize, url: String, dom: Element, title: String) -> Self {
@@ -247,7 +312,66 @@ impl Tab {
             is_discarded: false,
             compressed_dom: None,
             runtime: None,
+            is_disk_backed: false,
+            snapshot_path: None,
+            retained_estimate: Cell::new(RetainedBytesCache::default()),
         }
+    }
+
+    pub fn estimated_dom_bytes(&self) -> usize {
+        self.refresh_retained_estimate();
+        self.retained_estimate.get().dom_bytes
+    }
+
+    pub fn estimated_layout_bytes(&self) -> usize {
+        self.refresh_retained_estimate();
+        self.retained_estimate.get().layout_bytes
+    }
+
+    pub fn estimated_live_bytes(&self) -> usize {
+        self.estimated_dom_bytes()
+            .saturating_add(self.estimated_layout_bytes())
+    }
+
+    pub fn set_dom(&mut self, dom: Element) {
+        self.dom = dom;
+        self.invalidate_retained_estimate();
+    }
+
+    pub fn set_layout(&mut self, layout: Option<LayoutNode>) {
+        self.layout = layout;
+        self.invalidate_retained_estimate();
+    }
+
+    pub fn invalidate_retained_estimate(&mut self) {
+        self.retained_estimate.set(RetainedBytesCache::default());
+    }
+
+    pub fn is_disk_backed(&self) -> bool {
+        self.is_disk_backed
+    }
+
+    pub fn snapshot_path(&self) -> Option<&str> {
+        self.snapshot_path.as_deref()
+    }
+
+    fn refresh_retained_estimate(&self) {
+        let mut cached = self.retained_estimate.get();
+        if cached.valid
+            && cached.dom_root_children == self.dom.children.len()
+            && cached.layout_present == self.layout.is_some()
+        {
+            return;
+        }
+        cached.dom_bytes = crate::memory_tracker::MemoryTracker::estimate_dom(&self.dom);
+        cached.layout_bytes = self
+            .layout
+            .as_ref()
+            .map_or(0, crate::memory_tracker::MemoryTracker::estimate_layout);
+        cached.dom_root_children = self.dom.children.len();
+        cached.layout_present = self.layout.is_some();
+        cached.valid = true;
+        self.retained_estimate.set(cached);
     }
 
     pub fn url(&self) -> &str {
@@ -259,7 +383,7 @@ impl Tab {
             self.history.truncate(self.history_pos + 1);
         }
         self.url = url.clone();
-        self.layout = None;
+        self.set_layout(None);
         self.runtime = None;
     }
 
@@ -280,29 +404,30 @@ impl Tab {
             base_url,
         )?;
         let _ = runtime.run_document();
-        self.dom = runtime.dom_element();
+        let dom = runtime.dom_element();
+        self.set_dom(dom);
         self.runtime = Some(runtime);
         Ok(())
     }
 
     pub fn pump_runtime(&mut self, elapsed_ms: u64) -> Result<usize, String> {
-        if let Some(ref mut runtime) = self.runtime {
-            let processed = runtime.pump_events(elapsed_ms)?;
-            self.dom = runtime.dom_element();
-            Ok(processed)
-        } else {
-            Ok(0)
-        }
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Ok(0);
+        };
+        let processed = runtime.pump_events(elapsed_ms)?;
+        let dom = runtime.dom_element();
+        self.set_dom(dom);
+        Ok(processed)
     }
 
     pub fn evaluate_js(&mut self, script: &str) -> Result<crate::javascript::JsvValue, String> {
-        if let Some(ref mut runtime) = self.runtime {
-            let result = runtime.evaluate(script)?;
-            self.dom = runtime.dom_element();
-            Ok(result)
-        } else {
-            Err("No active runtime on tab".to_string())
-        }
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Err("No active runtime on tab".to_string());
+        };
+        let result = runtime.evaluate(script)?;
+        let dom = runtime.dom_element();
+        self.set_dom(dom);
+        Ok(result)
     }
 
     pub fn dispatch_event(
@@ -310,13 +435,13 @@ impl Tab {
         target: u64,
         event_type: &str,
     ) -> Result<crate::live_dom::DispatchReport, String> {
-        if let Some(ref mut runtime) = self.runtime {
-            let report = runtime.dispatch_event_by_type(target, event_type, None)?;
-            self.dom = runtime.dom_element();
-            Ok(report)
-        } else {
-            Err("No active runtime on tab".to_string())
-        }
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Err("No active runtime on tab".to_string());
+        };
+        let report = runtime.dispatch_event_by_type(target, event_type, None)?;
+        let dom = runtime.dom_element();
+        self.set_dom(dom);
+        Ok(report)
     }
 
     pub fn runtime_heap_bytes(&self) -> usize {
@@ -332,7 +457,8 @@ impl Tab {
             if last.url == entry.url {
                 *last = entry;
                 self.history_pos = self.history.len() - 1;
-                self.layout = None;
+                self.set_layout(None);
+                self.enforce_history_snapshot_budget();
                 return;
             }
         }
@@ -342,48 +468,84 @@ impl Tab {
             self.history.remove(0);
         }
         self.history_pos = self.history.len() - 1;
-        self.layout = None;
+        self.set_layout(None);
+        self.enforce_history_snapshot_budget();
     }
 
-    pub fn go_back(&mut self) -> bool {
-        if self.is_error {
-            if let Some(entry) = self.history.get(self.history_pos) {
-                self.url = entry.url.clone();
-                self.title = entry.title.clone();
-                self.dom = entry.get_dom().unwrap_or_else(|| Element::new("root"));
-                self.layout = None;
-                self.is_error = false;
-                return true;
+    fn enforce_history_snapshot_budget(&mut self) {
+        let mut retained: usize = self.history.iter().map(HistoryEntry::snapshot_bytes).sum();
+        let mut droppable = self
+            .history
+            .iter()
+            .filter(|entry| entry.has_dom)
+            .count()
+            .saturating_sub(resource_caps::TAB_RAM_SNAPSHOT_CAP);
+        for entry in self.history.iter_mut() {
+            if retained <= resource_caps::TAB_HISTORY_SNAPSHOT_BYTES || droppable == 0 {
+                break;
             }
-            return false;
-        }
-        if self.history_pos > 0 {
-            self.history_pos -= 1;
-            let entry = &self.history[self.history_pos];
-            self.url = entry.url.clone();
-            self.title = entry.title.clone();
-            self.dom = entry.get_dom().unwrap_or_else(|| Element::new("root"));
-            self.layout = None;
-            self.is_error = false;
-            true
-        } else {
-            false
+            if !entry.has_dom {
+                continue;
+            }
+            retained = retained.saturating_sub(entry.snapshot_bytes());
+            entry.release_snapshot();
+            droppable -= 1;
         }
     }
 
-    pub fn go_forward(&mut self) -> bool {
-        if self.history_pos + 1 < self.history.len() {
-            self.history_pos += 1;
-            let entry = &self.history[self.history_pos];
-            self.url = entry.url.clone();
-            self.title = entry.title.clone();
-            self.dom = entry.get_dom().unwrap_or_else(|| Element::new("root"));
-            self.layout = None;
-            self.is_error = false;
-            true
+    pub fn history_snapshot_bytes(&self) -> usize {
+        self.history
+            .iter()
+            .map(HistoryEntry::snapshot_bytes)
+            .sum::<usize>()
+            .saturating_add(self.compressed_snapshot_bytes())
+    }
+
+    fn navigate_history(&mut self, step: isize) -> HistoryNavigation {
+        let target = if self.is_error {
+            self.history_pos
         } else {
-            false
+            let next = self.history_pos as isize + step;
+            if next < 0 || next as usize >= self.history.len() {
+                return HistoryNavigation::Blocked;
+            }
+            next as usize
+        };
+        let Some(entry) = self.history.get(target) else {
+            return HistoryNavigation::Blocked;
+        };
+        let url = entry.url.clone();
+        let title = entry.title.clone();
+        let dom = entry.get_dom();
+        if self.is_disk_backed {
+            self.clear_disk_snapshot();
         }
+        self.history_pos = target;
+        self.url = url.clone();
+        self.title = title;
+        self.is_error = false;
+        self.is_sleeping = false;
+        self.slept_at = None;
+        self.last_active_timestamp = chrono::Utc::now().timestamp();
+        self.set_layout(None);
+        match dom {
+            Some(dom) => {
+                self.set_dom(dom);
+                HistoryNavigation::Moved
+            }
+            None => {
+                self.set_dom(Element::new("root"));
+                HistoryNavigation::NeedsReload(url)
+            }
+        }
+    }
+
+    pub fn go_back(&mut self) -> HistoryNavigation {
+        self.navigate_history(-1)
+    }
+
+    pub fn go_forward(&mut self) -> HistoryNavigation {
+        self.navigate_history(1)
     }
 
     pub fn can_go_back(&self) -> bool {
@@ -413,22 +575,12 @@ impl Tab {
             return 0;
         }
 
-        let dom_nodes = crate::count_elements(&self.dom);
-        let layout_nodes = self
-            .layout
-            .as_ref()
-            .map(crate::layout::count_layout_nodes)
-            .unwrap_or(0);
-
-        let original_size = dom_nodes * 210 + layout_nodes * 320;
-
+        let original_size = self.estimated_live_bytes();
         self.compressed_dom = self.compress_dom();
+        let freed_bytes = original_size.saturating_sub(self.compressed_snapshot_bytes());
 
-        let compressed_size = self.compressed_dom.as_ref().map_or(0, |d| d.len());
-        let freed_bytes = original_size.saturating_sub(compressed_size);
-
-        self.dom = Element::new("root");
-        self.layout = None;
+        self.set_dom(Element::new("root"));
+        self.set_layout(None);
         self.runtime = None;
         self.is_sleeping = true;
         self.slept_at = Some(chrono::Utc::now().timestamp());
@@ -444,20 +596,99 @@ impl Tab {
         self.is_sleeping = false;
         self.slept_at = None;
         self.last_active_timestamp = chrono::Utc::now().timestamp();
-        self.layout = None;
+        self.set_layout(None);
 
-        if let Some(ref compressed) = self.compressed_dom {
-            if let Ok(dom) = Self::decompress_dom(compressed) {
-                self.dom = dom;
-                self.compressed_dom = None;
+        if self.is_disk_backed {
+            if self.restore_from_disk() {
                 return WakeResult::RestoredFromCache;
             }
+            self.clear_disk_snapshot();
+            return WakeResult::NeedsReload(self.url.clone());
         }
 
-        self.dom = Element::new("root");
-        self.compressed_dom = None;
+        let snapshot = self.compressed_dom.take();
+        let restored = snapshot
+            .as_deref()
+            .and_then(|data| Self::decompress_dom(data).ok());
+        match restored {
+            Some(dom) => {
+                self.set_dom(dom);
+                WakeResult::RestoredFromCache
+            }
+            None => {
+                self.set_dom(Element::new("root"));
+                WakeResult::NeedsReload(self.url.clone())
+            }
+        }
+    }
 
-        WakeResult::NeedsReload(self.url.clone())
+    pub fn spill_to_disk(&mut self, directory: &std::path::Path) -> Result<usize, String> {
+        if self.is_disk_backed {
+            return Ok(0);
+        }
+        let released = self
+            .estimated_live_bytes()
+            .saturating_add(self.compressed_snapshot_bytes());
+        let json = bounded_dom_json(&self.dom, resource_caps::SNAPSHOT_JSON_RAM_BYTES)
+            .map_err(|error| error.to_string())?;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&json)
+            .map_err(|error| error.to_string())?;
+        let payload = encoder.finish().map_err(|error| error.to_string())?;
+
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        let path = directory.join(self.snapshot_file_name());
+        crate::fs_atomic::atomic_write_bytes(&path, &payload).map_err(|error| error.to_string())?;
+
+        self.snapshot_path = Some(path.to_string_lossy().into_owned());
+        self.is_disk_backed = true;
+        self.compressed_dom = None;
+        self.set_dom(Element::new("root"));
+        self.set_layout(None);
+        self.runtime = None;
+        self.is_sleeping = true;
+        self.slept_at = Some(chrono::Utc::now().timestamp());
+        Ok(released)
+    }
+
+    pub fn restore_from_disk(&mut self) -> bool {
+        let Some(path) = self.snapshot_path.clone() else {
+            return false;
+        };
+        let restored = std::fs::read(&path)
+            .ok()
+            .and_then(|data| decompress_dom_bytes(&data).ok());
+        match restored {
+            Some(dom) => {
+                self.set_dom(dom);
+                self.clear_disk_snapshot();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn clear_disk_snapshot(&mut self) {
+        if let Some(path) = self.snapshot_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.is_disk_backed = false;
+    }
+
+    fn snapshot_file_name(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.url.hash(&mut hasher);
+        format!("tab-{}-{:016x}.gz", self.id, hasher.finish())
+    }
+
+    pub fn disk_snapshot_bytes(&self) -> u64 {
+        self.snapshot_path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len())
     }
 
     pub fn can_sleep(&self) -> bool {
@@ -509,22 +740,14 @@ impl Tab {
             return None;
         }
 
-        const MAX_SNAPSHOT_JSON_BYTES: usize = 8 * 1024 * 1024;
-        let json = match serde_json::to_vec(&self.dom) {
+        const MAX_SNAPSHOT_JSON_BYTES: usize = resource_caps::SNAPSHOT_JSON_RAM_BYTES;
+        let json = match bounded_dom_json(&self.dom, MAX_SNAPSHOT_JSON_BYTES) {
             Ok(data) => data,
-            Err(e) => {
-                log::warn!("Failed to compress DOM for {}: {}", self.url, e);
+            Err(error) => {
+                log::warn!("Skipping sleep snapshot for {}: {error}", self.url);
                 return None;
             }
         };
-        if json.len() > MAX_SNAPSHOT_JSON_BYTES {
-            log::warn!(
-                "Skipping sleep snapshot for {}: {} bytes exceeds the cap",
-                self.url,
-                json.len()
-            );
-            return None;
-        }
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         match encoder.write_all(&json) {
@@ -592,18 +815,14 @@ impl Tab {
             return 0;
         }
 
-        let dom_nodes = crate::count_elements(&self.dom);
-        let layout_nodes = self
-            .layout
-            .as_ref()
-            .map(crate::layout::count_layout_nodes)
-            .unwrap_or(0);
-        let snapshot_bytes = self.compressed_dom.as_ref().map_or(0, |d| d.len());
-        let freed_bytes = dom_nodes * 210 + layout_nodes * 320 + snapshot_bytes;
+        let freed_bytes = self
+            .estimated_live_bytes()
+            .saturating_add(self.compressed_snapshot_bytes());
 
-        self.dom = Element::new("root");
-        self.layout = None;
+        self.set_dom(Element::new("root"));
+        self.set_layout(None);
         self.runtime = None;
+        self.clear_disk_snapshot();
 
         self.compressed_dom = None;
         self.is_sleeping = false;
@@ -620,8 +839,8 @@ impl Tab {
 
         self.is_discarded = false;
         self.last_active_timestamp = chrono::Utc::now().timestamp();
-        self.dom = Element::new("root");
-        self.layout = None;
+        self.set_dom(Element::new("root"));
+        self.set_layout(None);
 
         Some(self.url.clone())
     }
@@ -765,7 +984,11 @@ impl TabManager {
             }
         }
 
-        let removed = self.tabs.remove(&id);
+        let mut removed = self.tabs.remove(&id);
+
+        if let Some(tab) = removed.as_mut() {
+            tab.clear_disk_snapshot();
+        }
 
         if let Some(ref tab) = removed {
             if !tab.incognito && (tab.url.starts_with("http://") || tab.url.starts_with("https://"))
@@ -789,6 +1012,9 @@ impl TabManager {
     }
 
     pub fn close_all_tabs(&mut self) {
+        for tab in self.tabs.values_mut() {
+            tab.clear_disk_snapshot();
+        }
         self.tabs.clear();
         self.tab_order.clear();
         self.active_tab_id = None;
@@ -1073,7 +1299,7 @@ mod tests {
         tab.push_history(entry_b);
         assert_eq!(tab.history.len(), 2);
 
-        assert!(tab.go_back());
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
         assert_eq!(tab.url, "https://a.com");
         assert!(!tab.can_go_back());
     }
@@ -1096,11 +1322,11 @@ mod tests {
         tab.url = "https://b.com".to_string();
         tab.is_error = true;
 
-        assert!(tab.go_back());
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
         assert_eq!(tab.url, "https://a.com");
         assert!(!tab.is_error);
         assert!(tab.can_go_back());
-        assert!(tab.go_back());
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
         assert_eq!(tab.url, "https://newtab");
         assert!(!tab.can_go_back());
     }
@@ -1121,7 +1347,7 @@ mod tests {
             ));
         }
 
-        assert!(tab.go_back());
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
         assert_eq!(tab.url, "https://b.com");
         assert!(tab.can_go_forward());
         tab.push_history(HistoryEntry::new(
@@ -1131,10 +1357,10 @@ mod tests {
         ));
         assert_eq!(tab.url, "https://b.com");
         assert!(!tab.can_go_forward());
-        assert!(tab.go_back());
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
         assert_eq!(tab.url, "https://b.com");
         assert!(tab.can_go_forward());
-        assert!(tab.go_back());
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
         assert_eq!(tab.url, "https://a.com");
     }
 
@@ -1783,7 +2009,7 @@ mod tests {
             &page_b,
         ));
 
-        assert!(tab.go_back());
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
         assert_eq!(tab.url, "https://a.com");
         assert!(
             tab.dom.find_tag("p").is_some() || tab.dom.children.len() > 1,
@@ -1819,5 +2045,57 @@ mod tests {
             max_depth,
             crate::parser::MAX_DOM_DEPTH
         );
+    }
+
+    #[test]
+    fn back_navigation_on_disk_backed_tab_cannot_be_clobbered_by_later_wake() {
+        let scratch =
+            std::env::temp_dir().join(format!("sylphra-tab-history-{}", std::process::id()));
+        let mut tab = Tab::new(
+            1,
+            "https://a.com".to_string(),
+            Element::new("body"),
+            "A".to_string(),
+        );
+        tab.push_history(HistoryEntry::new(
+            "https://b.com".to_string(),
+            "B".to_string(),
+            &Element::new("body"),
+        ));
+        tab.spill_to_disk(&scratch).expect("spill");
+        assert!(tab.is_disk_backed());
+        assert!(tab.is_sleeping);
+
+        assert!(matches!(tab.go_back(), HistoryNavigation::Moved));
+        assert_eq!(tab.url, "https://a.com");
+        assert!(!tab.is_disk_backed());
+        assert!(!tab.is_sleeping);
+        assert!(matches!(tab.wake(), WakeResult::NotSleeping));
+        assert_eq!(tab.url, "https://a.com");
+        assert_eq!(tab.dom.tag, "body");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn back_navigation_with_evicted_snapshot_requests_reload_of_that_url() {
+        let mut tab = Tab::new(
+            1,
+            "https://a.com".to_string(),
+            Element::new("body"),
+            "A".to_string(),
+        );
+        tab.push_history(HistoryEntry::new(
+            "https://b.com".to_string(),
+            "B".to_string(),
+            &Element::new("body"),
+        ));
+        tab.history[0].release_snapshot();
+
+        match tab.go_back() {
+            HistoryNavigation::NeedsReload(url) => assert_eq!(url, "https://a.com"),
+            other => panic!("expected NeedsReload, got {other:?}"),
+        }
+        assert_eq!(tab.url, "https://a.com");
+        assert!(!tab.is_error);
     }
 }

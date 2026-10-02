@@ -52,15 +52,15 @@ fn is_spa_or_js_rendered(html: &str) -> bool {
 
     while i < len {
         if lower.as_bytes()[i] == b'<' {
-            if i + 1 < len && lower.as_bytes()[i + 1] == b's' {
-                if lower[i..].starts_with("<script")
+            if i + 1 < len
+                && lower.as_bytes()[i + 1] == b's'
+                && (lower[i..].starts_with("<script")
                     || lower[i..].starts_with("<style")
-                    || lower[i..].starts_with("<noscript")
-                {
-                    in_skip = true;
-                    i += 7;
-                    continue;
-                }
+                    || lower[i..].starts_with("<noscript"))
+            {
+                in_skip = true;
+                i += 7;
+                continue;
             }
             if lower[i..].starts_with("</") && in_skip {
                 in_skip = false;
@@ -412,6 +412,12 @@ pub fn format_memory_relief_status(report: &crate::memory_tracker::MemoryReliefR
             "Memory pressure: slept {} and discarded {} tab(s), freed {}",
             report.slept_tabs.len(),
             report.discarded_tabs.len(),
+            MemoryTracker::format_bytes(report.before_bytes.saturating_sub(report.after_bytes)),
+        ),
+        MemoryPressureLevel::Emergency => format!(
+            "Emergency shedding: discarded {} tab(s) of {}, freed {}",
+            report.discarded_tabs.len(),
+            MemoryTracker::format_bytes(report.system_available_bytes as usize),
             MemoryTracker::format_bytes(report.before_bytes.saturating_sub(report.after_bytes)),
         ),
     }
@@ -998,19 +1004,37 @@ impl Application for SylphraApp {
                 return self.navigate(url);
             }
             Message::GoBack => {
-                self.browser.go_back();
+                let outcome = self.browser.go_back();
 
                 #[cfg(target_os = "windows")]
                 self.teardown_youtube_playback_if_not_watching();
                 self.invalidate_active_tab_loads();
-                return self.after_tab_change("Navigated back");
+                match outcome {
+                    crate::tab::HistoryNavigation::NeedsReload(url) => {
+                        let settled = self.after_tab_change("Loading previous page");
+                        return Command::batch([settled, self.start_fetch(url)]);
+                    }
+                    crate::tab::HistoryNavigation::Moved
+                    | crate::tab::HistoryNavigation::Blocked => {
+                        return self.after_tab_change("Navigated back");
+                    }
+                }
             }
             Message::GoForward => {
-                self.browser.go_forward();
+                let outcome = self.browser.go_forward();
                 #[cfg(target_os = "windows")]
                 self.teardown_youtube_playback_if_not_watching();
                 self.invalidate_active_tab_loads();
-                return self.after_tab_change("Navigated forward");
+                match outcome {
+                    crate::tab::HistoryNavigation::NeedsReload(url) => {
+                        let settled = self.after_tab_change("Loading next page");
+                        return Command::batch([settled, self.start_fetch(url)]);
+                    }
+                    crate::tab::HistoryNavigation::Moved
+                    | crate::tab::HistoryNavigation::Blocked => {
+                        return self.after_tab_change("Navigated forward");
+                    }
+                }
             }
             Message::Reload => {
                 if let Some(tab) = self.browser.active_tab() {
@@ -1395,8 +1419,8 @@ impl Application for SylphraApp {
                                 Ok(processed) if processed > 0 => {
                                     if let Some(runtime) = tab.runtime.as_mut() {
                                         let render = runtime.refresh_render().clone();
-                                        tab.dom = render.dom;
-                                        tab.layout = render.layout;
+                                        tab.set_dom(render.dom);
+                                        tab.set_layout(render.layout);
                                         repaint = true;
                                     }
                                 }
@@ -1458,14 +1482,16 @@ impl Application for SylphraApp {
                 }
             }
             Message::MemoryPressureTick => {
-                let soft = self.browser.storage.settings.memory_soft_limit_mb;
-                let hard = self.browser.storage.settings.memory_pressure_threshold_mb;
-                let budget = crate::memory_tracker::MemoryBudget::from_mb(soft, hard);
+                for note in self.browser.poll_renderer_memory() {
+                    log::info!("{note}");
+                }
+                let budget = self.browser.memory_budget();
                 let report = self.browser.relieve_memory_pressure(budget, 2);
                 let status = format_memory_relief_status(&report);
                 if !status.is_empty() {
                     self.status_msg = status;
                 }
+                self.refresh_task_manager();
             }
             Message::ImagesLoaded {
                 images,
@@ -1898,8 +1924,8 @@ impl Application for SylphraApp {
                             let result = tab.evaluate_js(&code);
                             if let Some(runtime) = tab.runtime.as_mut() {
                                 let render = runtime.refresh_render().clone();
-                                tab.dom = render.dom;
-                                tab.layout = render.layout;
+                                tab.set_dom(render.dom);
+                                tab.set_layout(render.layout);
                                 repaint_page = true;
                             }
                             result
@@ -2011,35 +2037,7 @@ impl Application for SylphraApp {
             }
             Message::ToggleTaskManager => {
                 self.task_manager.toggle();
-                if self.task_manager.open {
-                    let mut infos = Vec::new();
-                    let estimate = self.browser.estimate_memory();
-                    for (idx, tab) in self.browser.tabs.iter().enumerate() {
-                        let memory_mb = estimate
-                            .tabs
-                            .get(idx)
-                            .map(|e| {
-                                crate::memory_tracker::MemoryTracker::bytes_to_mb(e.total_bytes)
-                            })
-                            .unwrap_or(0.0);
-
-                        let layout_nodes = tab
-                            .layout
-                            .as_ref()
-                            .map(crate::layout::count_layout_nodes)
-                            .unwrap_or_else(|| crate::count_elements(&tab.dom));
-                        infos.push(crate::task_manager::ProcessTaskInfo {
-                            tab_id: tab.id,
-                            title: tab.title.clone(),
-                            url: tab.url.clone(),
-                            memory_mb,
-                            cpu_percent: 0.0,
-                            layout_nodes,
-                            is_incognito: tab.incognito,
-                        });
-                    }
-                    self.task_manager.update_tasks(infos);
-                }
+                self.refresh_task_manager();
             }
             Message::ToggleTabSearch => {
                 self.tab_search_open = !self.tab_search_open;
@@ -2127,33 +2125,32 @@ impl Application for SylphraApp {
                     .content_control
                     .generate_cosmetic_css_for_origin(&url);
                 document_rules.extend(crate::css_parser::parse_css(&content_control_css));
-                let prepared_result = if let Some(pdf_bytes) = result.binary_body.as_deref() {
-                    crate::worker::prepare_pdf_isolated(
-                        pdf_bytes,
-                        &url,
-                        &document_rules,
-                        self.browser.viewport_width(),
-                        self.browser.viewport_height(),
-                    )
-                } else {
-                    crate::worker::prepare_document_isolated(
+                let is_youtube_route = crate::youtube::YouTubeRoute::parse(&url).is_ok();
+                let child_render_requested = !is_pdf
+                    && !is_youtube_route
+                    && url::Url::parse(&url)
+                        .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"));
+                let prepared = match child_render_requested.then(|| {
+                    self.browser
+                        .render_document_in_child(tab_id, &url, &html, &document_rules)
+                }) {
+                    Some(Some(prepared)) => prepared,
+                    _ => match self.prepare_document_off_thread(
+                        result.binary_body.as_deref(),
                         &html,
                         &url,
                         &document_rules,
-                        self.browser.viewport_width(),
-                        self.browser.viewport_height(),
-                    )
-                };
-                let prepared = match prepared_result {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        return self.update(Message::LoadError {
-                            err: format!("Document worker failed: {error}"),
-                            url,
-                            tab_id,
-                            seq,
-                        });
-                    }
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            return self.update(Message::LoadError {
+                                err: format!("Document worker failed: {error}"),
+                                url,
+                                tab_id,
+                                seq,
+                            });
+                        }
+                    },
                 };
                 let stats = prepared.stats.clone();
                 let parse_time = stats.parse_time_ms;
@@ -2195,7 +2192,6 @@ impl Application for SylphraApp {
                 let mut layout_tree = prepared.layout;
                 let mut rendered = prepared.rendered_text;
                 let mut page_runtime = None;
-                let is_youtube_route = crate::youtube::YouTubeRoute::parse(&url).is_ok();
 
                 if !is_pdf && !is_youtube_route {
                     let mut runtime_rules = document_rules;
@@ -2286,6 +2282,7 @@ impl Application for SylphraApp {
                 let target_is_active = self.browser.tabs.active_tab_id() == Some(tab_id);
                 if let Some(tab) = self.browser.tabs.get_tab_mut(tab_id) {
                     if tab.is_sleeping || tab.is_discarded {
+                        tab.clear_disk_snapshot();
                         tab.compressed_dom = None;
                         tab.is_sleeping = false;
                         tab.is_discarded = false;
@@ -2296,16 +2293,18 @@ impl Application for SylphraApp {
                         crate::tab::HistoryEntry::new(url.clone(), title.clone(), &dom);
                     tab.push_history(loaded_entry);
                     tab.is_error = false;
-                    tab.dom = dom;
+                    tab.set_dom(dom);
                     tab.title = title.clone();
                     tab.url = url.clone();
 
-                    tab.layout = layout_tree.clone();
+                    tab.set_layout(layout_tree.clone());
                     tab.runtime = page_runtime;
                 } else {
                     self.is_loading = false;
                     return Command::none();
                 }
+
+                self.observe_navigation_memory();
 
                 if !incognito {
                     self.browser.storage.add_history(&url, &title);
@@ -2451,7 +2450,7 @@ impl Application for SylphraApp {
                             })
                             .unwrap_or_else(|| rendered.clone());
                         if let Some(tab) = self.browser.tabs.get_tab_mut(tab_id) {
-                            tab.layout = recovery_layout;
+                            tab.set_layout(recovery_layout);
 
                             tab.runtime = None;
                         }
@@ -2567,10 +2566,10 @@ impl Application for SylphraApp {
                 let dom = parse_html(&error_html);
                 let target_is_active = self.browser.tabs.active_tab_id() == Some(tab_id);
                 if let Some(tab) = self.browser.tabs.get_tab_mut(tab_id) {
-                    tab.dom = dom;
+                    tab.set_dom(dom);
                     tab.title = title.clone();
                     tab.url = url;
-                    tab.layout = None;
+                    tab.set_layout(None);
                     tab.is_error = true;
                 }
 
@@ -2656,7 +2655,7 @@ impl Application for SylphraApp {
         let pressure_threshold = self.browser.storage.settings.memory_pressure_threshold_mb;
         if pressure_threshold > 0 {
             subs.push(
-                iced::time::every(std::time::Duration::from_secs(60))
+                iced::time::every(self.browser.next_pressure_interval())
                     .map(|_| Message::MemoryPressureTick),
             );
         }
@@ -3108,7 +3107,7 @@ impl SylphraApp {
             let entry = crate::tab::HistoryEntry::new(url.to_string(), title.clone(), &dom);
             tab.push_history(entry);
             tab.is_error = false;
-            tab.dom = dom;
+            tab.set_dom(dom);
             tab.title = title.clone();
             tab.url = url.to_string();
         }
@@ -3320,6 +3319,83 @@ impl SylphraApp {
         self.rebuild_display_list();
         self.browser.persist_session();
         self.schedule_image_loading()
+    }
+
+    fn observe_navigation_memory(&mut self) {
+        self.browser.sync_tab_budgets();
+        self.browser.enforce_tab_budgets();
+        let budget = self.browser.memory_budget();
+        if !budget.is_enforced() {
+            return;
+        }
+        let report = self.browser.relieve_memory_pressure(budget, 2);
+        let status = format_memory_relief_status(&report);
+        if !status.is_empty() {
+            self.status_msg = status;
+        }
+    }
+
+    fn prepare_document_off_thread(
+        &mut self,
+        pdf_bytes: Option<&[u8]>,
+        html: &str,
+        url: &str,
+        document_rules: &[crate::css_parser::CssRule],
+    ) -> Result<crate::document::PreparedDocument, String> {
+        let width = self.browser.viewport_width();
+        let height = self.browser.viewport_height();
+        match pdf_bytes {
+            Some(pdf_bytes) => {
+                crate::worker::prepare_pdf_isolated(pdf_bytes, url, document_rules, width, height)
+            }
+            None => {
+                crate::worker::prepare_document_isolated(html, url, document_rules, width, height)
+            }
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn refresh_task_manager(&mut self) {
+        if !self.task_manager.open {
+            return;
+        }
+        let estimate = self.browser.estimate_memory();
+        let summary = self.browser.governance_summary();
+        let committed = self.browser.committed_bytes_by_tab();
+        let mut infos = Vec::new();
+        for (idx, tab) in self.browser.tabs.iter().enumerate() {
+            let memory_mb = estimate
+                .tabs
+                .get(idx)
+                .map(|entry| crate::memory_tracker::MemoryTracker::bytes_to_mb(entry.total_bytes))
+                .unwrap_or(0.0);
+            let layout_nodes = tab
+                .layout
+                .as_ref()
+                .map(crate::layout::count_layout_nodes)
+                .unwrap_or_else(|| crate::count_elements(&tab.dom));
+            let committed_mb = committed
+                .iter()
+                .find(|(id, _)| *id == tab.id)
+                .map_or(0.0, |(_, bytes)| {
+                    crate::memory_tracker::MemoryTracker::bytes_to_mb(*bytes)
+                });
+            infos.push(crate::task_manager::ProcessTaskInfo {
+                tab_id: tab.id,
+                title: tab.title.clone(),
+                url: tab.url.clone(),
+                memory_mb,
+                cpu_percent: 0.0,
+                layout_nodes,
+                is_incognito: tab.incognito,
+                committed_mb,
+                is_sleeping: tab.is_sleeping,
+                is_disk_backed: tab.is_disk_backed(),
+                is_discarded: tab.is_discarded,
+            });
+        }
+        self.task_manager.update_tasks(infos);
+        self.task_manager.update_summary(summary);
     }
 
     fn is_search_active(&self, url: &str) -> bool {
@@ -3683,6 +3759,7 @@ impl SylphraApp {
         let memory = self.browser.estimate_memory();
         let soft = self.browser.storage.settings.memory_soft_limit_mb;
         let hard = self.browser.storage.settings.memory_pressure_threshold_mb;
+        let summary = &self.task_manager.summary;
         let mut tasks = column![row![
             text(format!(
                 "Task Manager — {:.1} MB estimated (images {:.1}, resources {:.1}; budget {soft}/{hard} MB)",
@@ -3701,6 +3778,91 @@ impl SylphraApp {
         .align_items(iced::Alignment::Center)]
         .spacing(5);
 
+        tasks = tasks.push(
+            row![
+                text(summary.parsing_path())
+                    .size(11)
+                    .style(iced::theme::Text::from(if summary.fallback_parsing {
+                        pal.danger
+                    } else {
+                        pal.text_dim
+                    })),
+                text(format!(
+                    "measured RSS {:.1} MB (main {:.1}, children {:.1} across {})",
+                    summary.measured_mb(),
+                    summary.main_rss_mb,
+                    summary.child_rss_mb,
+                    summary.native_renderer_count
+                ))
+                .size(11)
+                .style(iced::theme::Text::from(pal.text_dim)),
+                text(format!(
+                    "committed {:.1} MB, reserved {:.1} MB",
+                    summary.committed_mb, summary.reserved_mb
+                ))
+                .size(11)
+                .style(iced::theme::Text::from(pal.text_dim)),
+                text(format!(
+                    "shared tag and attribute names saved {:.1} MB",
+                    summary.interned_savings_mb
+                ))
+                .size(11)
+                .style(iced::theme::Text::from(pal.text_dim)),
+                text(format!(
+                    "rejected {} ({:.1} MB)",
+                    summary.denied_reservations, summary.denied_mb
+                ))
+                .size(11)
+                .style(iced::theme::Text::from(
+                    if summary.denied_reservations > 0 {
+                        pal.danger
+                    } else {
+                        pal.text_dim
+                    }
+                )),
+                text(format!(
+                    "pressure {} — {} ({} MB free)",
+                    summary.pressure_level,
+                    summary.reason(),
+                    summary.system_available_mb as u32
+                ))
+                .size(11)
+                .style(iced::theme::Text::from(if summary.relief_required {
+                    pal.danger
+                } else {
+                    pal.text_dim
+                })),
+            ]
+            .spacing(14),
+        );
+
+        let mut active_subsystems: Vec<&crate::task_manager::SubsystemCeilingReport> = summary
+            .subsystems
+            .iter()
+            .filter(|subsystem| subsystem.held_mb > 0.0)
+            .collect();
+        active_subsystems.sort_by(|a, b| b.utilisation_percent.cmp(&a.utilisation_percent));
+        for subsystem in active_subsystems {
+            tasks = tasks.push(
+                row![text(format!(
+                    "{} {:.1}/{:.0} MB ceiling ({}%)",
+                    subsystem.label,
+                    subsystem.held_mb,
+                    subsystem.ceiling_mb,
+                    subsystem.utilisation_percent
+                ))
+                .size(11)
+                .style(iced::theme::Text::from(
+                    if subsystem.utilisation_percent >= 80 {
+                        pal.danger
+                    } else {
+                        pal.text_dim
+                    }
+                ))]
+                .spacing(14),
+            );
+        }
+
         for task in &self.task_manager.tasks {
             let index = self
                 .browser
@@ -3708,6 +3870,15 @@ impl SylphraApp {
                 .iter_tabs()
                 .into_iter()
                 .position(|tab| tab.id == task.tab_id);
+            let state = if task.is_discarded {
+                "discarded"
+            } else if task.is_disk_backed {
+                "on disk"
+            } else if task.is_sleeping {
+                "sleeping"
+            } else {
+                "active"
+            };
             let mut task_row = row![
                 text(truncate_label(&task.title, 30))
                     .size(12)
@@ -3715,9 +3886,22 @@ impl SylphraApp {
                 text(format!("{:.1} MB", task.memory_mb))
                     .size(11)
                     .width(Length::Fixed(80.0)),
+                text(format!("{:.1} MB ledger", task.committed_mb))
+                    .size(11)
+                    .width(Length::Fixed(120.0)),
                 text(format!("{} nodes", task.layout_nodes))
                     .size(11)
                     .width(Length::Fixed(90.0)),
+                text(state)
+                    .size(11)
+                    .width(Length::Fixed(70.0))
+                    .style(iced::theme::Text::from(
+                        if task.is_discarded || task.is_sleeping {
+                            pal.text_dim
+                        } else {
+                            pal.text
+                        }
+                    )),
             ]
             .spacing(8)
             .align_items(iced::Alignment::Center);

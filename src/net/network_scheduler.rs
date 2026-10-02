@@ -712,7 +712,7 @@ fn inject_external_resources(
                     element.attrs.remove("src");
                 }
                 ExternalResourceKind::Style => {
-                    element.tag = "style".to_string();
+                    element.tag = "style".into();
                     element.attrs.remove("href");
                     element.attrs.remove("rel");
                     element.is_void = false;

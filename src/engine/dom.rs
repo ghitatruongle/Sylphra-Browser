@@ -84,9 +84,10 @@ pub fn set_attribute(element: &mut Element, name: &str, value: &str) -> bool {
     {
         return false;
     }
-    element
-        .attrs
-        .insert(name, value.chars().take(64 * 1024).collect());
+    element.attrs.insert(
+        crate::string_pool::InternedString::new(&name),
+        value.chars().take(64 * 1024).collect(),
+    );
     true
 }
 

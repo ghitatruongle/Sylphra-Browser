@@ -14,6 +14,15 @@ fn main() {
         Ok(None) => {}
     }
 
+    match sylphra::ram_gauge::try_run_cli(&args) {
+        Ok(Some(passed)) => std::process::exit(if passed { 0 } else { 2 }),
+        Err(error) => {
+            log::error!("Ram gauge failed: {error}");
+            std::process::exit(2);
+        }
+        Ok(None) => {}
+    }
+
     let initial_target = std::env::args_os().nth(1).map(|argument| {
         let argument = argument.to_string_lossy().into_owned();
         if let Some(report_path) = argument.strip_prefix("--release-smoke-report=") {

@@ -160,9 +160,98 @@ fn count_dom_nodes(element: &Element) -> usize {
     count
 }
 
+pub fn skeleton_document(document: &mut PreparedDocument, max_depth: usize, text_budget: usize) {
+    skeleton_element(&mut document.dom, 1, max_depth.max(1));
+    let mut rendered = String::new();
+    collect_skeleton_text(&document.dom, text_budget, &mut rendered);
+    document.rendered_text = rendered;
+    document.layout = None;
+    document.accessibility = crate::accessibility::AccessibilityTree {
+        root: None,
+        node_count: 0,
+        truncated: true,
+    };
+}
+
+fn skeleton_element(element: &mut Element, depth: usize, max_depth: usize) {
+    clamp_str(&mut element.text, SKELETON_NODE_TEXT_BYTES);
+    element.attrs.retain(|_, value| {
+        clamp_str(value, SKELETON_ATTRIBUTE_TEXT_BYTES);
+        true
+    });
+    if depth >= max_depth {
+        element.children.clear();
+        return;
+    }
+    for child in &mut element.children {
+        skeleton_element(child, depth + 1, max_depth);
+    }
+}
+
+fn collect_skeleton_text(element: &Element, budget: usize, output: &mut String) {
+    if output.len() >= budget {
+        return;
+    }
+    if !element.text.trim().is_empty() {
+        let remaining = budget.saturating_sub(output.len());
+        let mut end = remaining.min(element.text.len());
+        while end > 0 && !element.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(element.text[..end].trim());
+        output.push('\n');
+    }
+    for child in &element.children {
+        collect_skeleton_text(child, budget, output);
+    }
+}
+
+fn clamp_str(value: &mut String, limit: usize) {
+    if value.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+const SKELETON_NODE_TEXT_BYTES: usize = 512;
+const SKELETON_ATTRIBUTE_TEXT_BYTES: usize = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skeleton_keeps_structure_and_drops_layout() {
+        let mut prepared = prepare_document_static(
+            "<html><body><div><p>deep text</p></div></body></html>",
+            "skeleton",
+            &[],
+            800,
+            600,
+        );
+        skeleton_document(
+            &mut prepared,
+            crate::resource_caps::DOM_TRANSFER_SKELETON_DEPTH,
+            4096,
+        );
+        assert!(prepared.layout.is_none());
+        assert!(prepared.rendered_text.contains("deep text"));
+
+        let mut shallow = prepare_document_static(
+            "<html><body><div><p>gone</p></div></body></html>",
+            "skeleton",
+            &[],
+            800,
+            600,
+        );
+        let breadth = shallow.dom.children.len();
+        skeleton_document(&mut shallow, 1, 4096);
+        assert!(shallow.dom.children.is_empty() || breadth == 0);
+    }
 
     #[test]
     fn prepares_title_inline_style_and_stats() {

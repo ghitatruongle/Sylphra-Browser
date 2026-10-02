@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -68,7 +68,7 @@ struct CachedStyle {
 
 #[derive(Debug, Clone)]
 struct ElementPaintData {
-    attrs: HashMap<String, String>,
+    attrs: crate::parser::Attributes,
     text: String,
     is_void: bool,
 }

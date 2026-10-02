@@ -146,8 +146,11 @@ impl CanvasFingerprintProtector {
 pub struct UserAgentMasker;
 
 impl UserAgentMasker {
-    pub fn get_masked_user_agent() -> &'static str {
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Sylphra/0.0.0-alpha"
+    pub const fn get_masked_user_agent() -> &'static str {
+        concat!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Sylphra/",
+            env!("CARGO_PKG_VERSION")
+        )
     }
 }
 
