@@ -728,6 +728,9 @@ pub enum Message {
     GoBack,
     GoForward,
     Reload,
+    CompatTick,
+    ToggleCompat,
+    WindowResized,
     Home,
     FocusUrl,
     ReplaceUrl,
@@ -967,6 +970,23 @@ impl Application for SylphraApp {
 
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
+            Message::ToggleCompat => {
+                self.status_msg = self.browser.request_compat_for_active_tab();
+                self.browser.sync_compat_visibility();
+                return Command::none();
+            }
+            Message::CompatTick => {
+                for note in self.browser.tick_compat() {
+                    log::info!("{note}");
+                    self.status_msg = note;
+                }
+                self.browser.sync_compat_visibility();
+                return Command::none();
+            }
+            Message::WindowResized => {
+                self.browser.refresh_compat_bounds();
+                return Command::none();
+            }
             Message::UrlChanged(url) => {
                 let active_url = self
                     .browser
@@ -1041,6 +1061,14 @@ impl Application for SylphraApp {
                     let url = tab.url.clone();
                     if url.starts_with("sylphra://search") || url.starts_with("ghita://search") {
                         return self.start_search(&url);
+                    }
+                    #[cfg(all(windows, feature = "compat-webview2"))]
+                    let compat_tab = self.browser.compat_active_for(tab.id).then_some(tab.id);
+                    #[cfg(all(windows, feature = "compat-webview2"))]
+                    if let Some(tab_id) = compat_tab {
+                        self.status_msg = self.browser.reload_compat_surface(tab_id);
+                        self.browser.sync_compat_visibility();
+                        return self.after_tab_change("Reloaded");
                     }
                     if url.starts_with("http://")
                         || url.starts_with("https://")
@@ -1485,6 +1513,9 @@ impl Application for SylphraApp {
                 for note in self.browser.poll_renderer_memory() {
                     log::info!("{note}");
                 }
+                for note in self.browser.apply_compat_pressure() {
+                    log::info!("{note}");
+                }
                 let budget = self.browser.memory_budget();
                 let report = self.browser.relieve_memory_pressure(budget, 2);
                 let status = format_memory_relief_status(&report);
@@ -1551,6 +1582,7 @@ impl Application for SylphraApp {
                     #[cfg(target_os = "windows")]
                     self.teardown_youtube_playback_for_tab(id);
                     self.browser.tabs.remove_tab(id);
+                    self.browser.close_compat_surface(id);
                     self.task_manager.tasks.retain(|task| task.tab_id != id);
                     self.search_state.remove(&id);
                     self.pending_loads.remove(&id);
@@ -1567,6 +1599,7 @@ impl Application for SylphraApp {
                     #[cfg(target_os = "windows")]
                     self.teardown_youtube_playback_for_tab(id);
                     self.browser.tabs.remove_tab(id);
+                    self.browser.close_compat_surface(id);
                     self.task_manager.tasks.retain(|task| task.tab_id != id);
                     self.search_state.remove(&id);
                     self.pending_loads.remove(&id);
@@ -2552,6 +2585,20 @@ impl Application for SylphraApp {
                 let (title, friendly_msg) = humanize_error(&err);
                 self.status_msg = format!("Error loading {}: {}", url, err);
 
+                #[cfg(all(windows, feature = "compat-webview2"))]
+                if (url.starts_with("http://") || url.starts_with("https://"))
+                    && !self.browser.compat_active_for(tab_id)
+                    && self.browser.backend_allows_compat_fallback()
+                {
+                    let incognito = self
+                        .browser
+                        .tabs
+                        .get_tab(tab_id)
+                        .is_some_and(|tab| tab.incognito);
+                    let config = self.browser.adblocker.config().clone();
+                    self.status_msg = self.browser.open_compat(tab_id, &url, incognito, config);
+                }
+
                 let safe_url = html_escape(&url);
                 let safe_title = html_escape(&title);
                 let error_html = format!(
@@ -2660,6 +2707,18 @@ impl Application for SylphraApp {
             );
         }
 
+        #[cfg(all(windows, feature = "compat-webview2"))]
+        if self.browser.compat_pending() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(60))
+                    .map(|_| Message::CompatTick),
+            );
+        } else if self.browser.compat_active() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::CompatTick),
+            );
+        }
+
         let active_runtime = self.browser.active_tab().is_some_and(|tab| {
             tab.runtime
                 .as_ref()
@@ -2691,6 +2750,7 @@ fn handle_keyboard_event(event: iced::Event, _status: iced::event::Status) -> Op
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
             handle_keyboard(key, modifiers)
         }
+        iced::Event::Window(_, iced::window::Event::Resized { .. }) => Some(Message::WindowResized),
         _ => None,
     }
 }
@@ -2727,6 +2787,7 @@ fn handle_keyboard(
                 Some(Message::OpenInternalPage("sylphra://bookmarks".to_string()))
             }
             Key::Character(c) if c == "i" || c == "I" => Some(Message::ToggleDevTools),
+            Key::Character(c) if c == "g" || c == "G" => Some(Message::ToggleCompat),
             Key::Named(Named::Tab) => Some(Message::PrevTab),
             _ => None,
         };
@@ -2832,6 +2893,22 @@ impl SylphraApp {
     fn navigate(&mut self, target: String) -> Command<Message> {
         self.show_menu = false;
         self.show_suggestions = false;
+        #[cfg(all(windows, feature = "compat-webview2"))]
+        if let Some(tab_id) = self.browser.tabs.active_tab_id() {
+            if self.browser.compat_active_for(tab_id) {
+                let web_target = target.starts_with("http://")
+                    || target.starts_with("https://")
+                    || target.starts_with("file://");
+                if web_target {
+                    let secure = self.browser.secure_navigation_url(&target);
+                    self.status_msg = format!("Compatibility navigating {secure}");
+                    let _ = self.browser.navigate_compat_surface(tab_id, &secure);
+                    self.url_input = secure;
+                    return self.after_tab_change("Compatibility navigation");
+                }
+                self.browser.close_compat_surface(tab_id);
+            }
+        }
         #[cfg(target_os = "windows")]
         if let Ok(route) = crate::youtube::YouTubeRoute::parse(&target) {
             match route {
@@ -3144,6 +3221,7 @@ impl SylphraApp {
         self.rendered_content = self.browser.render_current();
         self.rebuild_display_list();
         self.show_suggestions = false;
+        self.browser.sync_compat_visibility();
     }
 
     fn rebuild_display_list(&mut self) {
@@ -3841,7 +3919,7 @@ impl SylphraApp {
             .iter()
             .filter(|subsystem| subsystem.held_mb > 0.0)
             .collect();
-        active_subsystems.sort_by(|a, b| b.utilisation_percent.cmp(&a.utilisation_percent));
+        active_subsystems.sort_by_key(|subsystem| std::cmp::Reverse(subsystem.utilisation_percent));
         for subsystem in active_subsystems {
             tasks = tasks.push(
                 row![text(format!(
@@ -4476,6 +4554,22 @@ impl SylphraApp {
                 .style(move |_: &Theme| container::Appearance {
                     background: Some(iced::Background::Color(pal.content_bg)),
                     text_color: Some(pal.text),
+                    ..Default::default()
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
+        #[cfg(all(windows, feature = "compat-webview2"))]
+        if self
+            .browser
+            .active_tab()
+            .is_some_and(|tab| self.browser.compat_active_for(tab.id))
+        {
+            return container(text("").size(1))
+                .style(move |_: &Theme| container::Appearance {
+                    background: Some(iced::Background::Color(pal.content_bg)),
                     ..Default::default()
                 })
                 .width(Length::Fill)

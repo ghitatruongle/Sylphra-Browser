@@ -7,6 +7,7 @@ pub enum ProcessRole {
     Network,
     Media,
     Gpu,
+    WebViewHost { origin: String },
 }
 
 impl fmt::Display for ProcessRole {
@@ -17,6 +18,7 @@ impl fmt::Display for ProcessRole {
             ProcessRole::Network => write!(f, "Network"),
             ProcessRole::Media => write!(f, "Media"),
             ProcessRole::Gpu => write!(f, "Gpu"),
+            ProcessRole::WebViewHost { origin } => write!(f, "WebViewHost[{origin}]"),
         }
     }
 }
@@ -29,6 +31,9 @@ impl ProcessRole {
             ProcessRole::Network => crate::resource_caps::NETWORK_PROCESS_MEMORY_BYTES,
             ProcessRole::Media => crate::resource_caps::MEDIA_PROCESS_MEMORY_BYTES,
             ProcessRole::Gpu => crate::resource_caps::GPU_PROCESS_MEMORY_BYTES,
+            ProcessRole::WebViewHost { .. } => {
+                crate::resource_caps::WEBVIEW_HOST_PROCESS_MEMORY_BYTES
+            }
         }
     }
 
@@ -107,5 +112,22 @@ mod tests {
         }
         .enforces_ui_restrictions());
         assert!(!ProcessRole::Browser.enforces_ui_restrictions());
+    }
+
+    #[test]
+    fn webview_host_role_is_a_bounded_renderer() {
+        let role = ProcessRole::WebViewHost {
+            origin: "https://modern.example".to_string(),
+        };
+        assert_eq!(role.to_string(), "WebViewHost[https://modern.example]");
+        assert_eq!(
+            role.memory_limit_bytes(),
+            crate::resource_caps::WEBVIEW_HOST_PROCESS_MEMORY_BYTES
+        );
+        assert!(role.enforces_ui_restrictions());
+        assert!(
+            role.memory_limit_bytes()
+                < crate::resource_caps::mb(crate::resource_caps::GLOBAL_HARD_WITH_WEBVIEW_MB)
+        );
     }
 }

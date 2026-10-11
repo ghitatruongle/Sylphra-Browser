@@ -21,9 +21,10 @@ env:
   # invocation.
   CARGO_BUILD_JOBS: 1
   CARGO_INCREMENTAL: 0
-  # Deep but legitimate page recursion in debug JS needs more than the
-  # default 2 MB test-thread stack (see MAX_CALL_DEPTH in javascript.rs).
-  RUST_MIN_STACK: 16777216
+  # WebView2 COM bindings (compat-webview2) plus deep debug-JS page recursion
+  # (see MAX_CALL_DEPTH in javascript.rs) overflow smaller worker stacks;
+  # 64 MB is the validated floor for full release and all-target codegen.
+  RUST_MIN_STACK: 67108864
 
 jobs:
   quality:
@@ -50,6 +51,8 @@ jobs:
         run: ./tools/audit-rustsec.ps1
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -j 1 -- -D warnings
+      - name: Compatibility backend tests
+        run: cargo test --lib --features compat-webview2 --locked -j 1
 
   release:
     name: Release artifact
@@ -69,7 +72,7 @@ jobs:
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build release
-        run: cargo build --release --locked -j 1
+        run: cargo build --release --locked -j 1 --features compat-webview2
       - name: Generate frozen source manifest
         shell: pwsh
         run: ./tools/make-source-manifest.ps1 -OutputPath ./source-freeze.json -ReleaseVersion $env:RELEASE_VERSION
@@ -80,6 +83,9 @@ jobs:
           Copy-Item target/release/sylphra.exe portable/Sylphra.exe
           Copy-Item target/release/sylphra-renderer-worker.exe portable/
           Copy-Item target/release/sylphra-browser-child.exe portable/
+          $loader = Get-ChildItem -Path target/release/build -Recurse -Filter WebView2Loader.dll | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1
+          if (-not $loader) { throw "x64 WebView2Loader.dll was not produced by the compat-webview2 release build" }
+          Copy-Item $loader.FullName portable/
           Copy-Item icon.ico,LICENSE,README.md,THIRD_PARTY_NOTICES.md portable/
       - name: Upload portable artifact
         uses: actions/upload-artifact@v7

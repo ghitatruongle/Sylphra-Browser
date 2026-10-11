@@ -15,10 +15,11 @@ pub enum SubsystemId {
     Gpu,
     WorkerIpc,
     StorageWrite,
+    WebView,
 }
 
 impl SubsystemId {
-    pub const fn all() -> [SubsystemId; 9] {
+    pub const fn all() -> [SubsystemId; 10] {
         [
             SubsystemId::DomTree,
             SubsystemId::LayoutTree,
@@ -29,6 +30,7 @@ impl SubsystemId {
             SubsystemId::Gpu,
             SubsystemId::WorkerIpc,
             SubsystemId::StorageWrite,
+            SubsystemId::WebView,
         ]
     }
 
@@ -43,6 +45,7 @@ impl SubsystemId {
             SubsystemId::Gpu => "gpu",
             SubsystemId::WorkerIpc => "ipc",
             SubsystemId::StorageWrite => "storage",
+            SubsystemId::WebView => "webview",
         }
     }
 
@@ -61,6 +64,7 @@ impl SubsystemId {
             SubsystemId::StorageWrite => {
                 resource_caps::mb(resource_caps::SUBSYSTEM_STORAGE_WRITE_MB)
             }
+            SubsystemId::WebView => resource_caps::mb(resource_caps::SUBSYSTEM_WEBVIEW_MB),
         }
     }
 }
@@ -396,9 +400,10 @@ impl ResourceLedger {
                 scope: DenyScope::UnknownSubsystem,
             });
         };
-        if counters.held_bytes().saturating_add(bytes) > counters.ceiling_bytes {
-            let available = counters.ceiling_bytes.saturating_sub(counters.held_bytes());
-            let ceiling = counters.ceiling_bytes;
+        let ceiling = counters.ceiling_bytes;
+        let held = counters.held_bytes();
+        if held.saturating_add(bytes) > ceiling {
+            let available = ceiling.saturating_sub(held);
             state.record_denial(subsystem, bytes);
             return Err(ResourceDenied {
                 subsystem,
@@ -414,8 +419,6 @@ impl ResourceLedger {
             .saturating_add(state.reserved_total)
             .saturating_add(bytes);
         if projected > limits.hard_bytes {
-            let counters = state.subsystems.get(&subsystem).unwrap();
-            let ceiling = counters.ceiling_bytes;
             let available = limits
                 .hard_bytes
                 .saturating_sub(projected.saturating_sub(bytes));
@@ -431,7 +434,17 @@ impl ResourceLedger {
         }
         let id = state.next_id;
         state.next_id = id.saturating_add(1);
-        let counters = state.subsystems.get_mut(&subsystem).unwrap();
+        let Some(counters) = state.subsystems.get_mut(&subsystem) else {
+            state.record_denial(subsystem, bytes);
+            return Err(ResourceDenied {
+                subsystem,
+                owner,
+                requested_bytes: bytes,
+                available_bytes: 0,
+                ceiling_bytes: 0,
+                scope: DenyScope::UnknownSubsystem,
+            });
+        };
         counters.reserved_bytes = counters.reserved_bytes.saturating_add(bytes);
         state.reserved_total = state.reserved_total.saturating_add(bytes);
         state.grant_count = state.grant_count.saturating_add(1);
@@ -628,7 +641,17 @@ impl ResourceLedger {
                 scope: DenyScope::GlobalHardLimit,
             });
         }
-        let counters = state.subsystems.get_mut(&subsystem).unwrap();
+        let Some(counters) = state.subsystems.get_mut(&subsystem) else {
+            state.record_denial(subsystem, bytes);
+            return Err(ResourceDenied {
+                subsystem,
+                owner,
+                requested_bytes: bytes,
+                available_bytes: 0,
+                ceiling_bytes: 0,
+                scope: DenyScope::UnknownSubsystem,
+            });
+        };
         counters.committed_bytes = counters.committed_bytes.saturating_add(bytes);
         if let Some(record) = state.records.get_mut(&id) {
             record.committed_bytes = record.committed_bytes.saturating_add(bytes);
@@ -678,7 +701,7 @@ impl ResourceLedger {
                 state
                     .records
                     .get(*id)
-                    .map_or(true, |record| record.owner == owner)
+                    .is_none_or(|record| record.owner == owner)
             })
             .map(|(key, _)| *key)
             .collect();

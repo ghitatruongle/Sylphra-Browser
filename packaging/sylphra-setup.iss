@@ -54,6 +54,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\target\release\sylphra.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "..\target\release\sylphra-renderer-worker.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\sylphra-browser-child.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion

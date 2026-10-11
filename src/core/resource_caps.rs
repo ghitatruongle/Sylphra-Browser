@@ -9,6 +9,9 @@ pub const fn mb(count: u32) -> usize {
 pub const GLOBAL_SOFT_LIMIT_MB: u32 = 400;
 pub const GLOBAL_HARD_LIMIT_MB: u32 = 500;
 
+pub const GLOBAL_SOFT_WITH_WEBVIEW_MB: u32 = 700;
+pub const GLOBAL_HARD_WITH_WEBVIEW_MB: u32 = 900;
+
 pub const SUBSYSTEM_DOM_TREE_MB: u32 = 192;
 pub const SUBSYSTEM_LAYOUT_TREE_MB: u32 = 128;
 pub const SUBSYSTEM_RUNTIME_HEAP_MB: u32 = 256;
@@ -18,6 +21,7 @@ pub const SUBSYSTEM_MEDIA_MB: u32 = 320;
 pub const SUBSYSTEM_GPU_MB: u32 = 96;
 pub const SUBSYSTEM_WORKER_IPC_MB: u32 = 64;
 pub const SUBSYSTEM_STORAGE_WRITE_MB: u32 = 32;
+pub const SUBSYSTEM_WEBVIEW_MB: u32 = 320;
 
 pub const TAB_LIVE_BUDGET_BYTES: usize = mb(64);
 pub const TAB_RUNTIME_HEAP_BYTES: usize = mb(32);
@@ -75,6 +79,12 @@ pub const MEDIA_PROCESS_MEMORY_BYTES: usize = mb(320);
 pub const GPU_PROCESS_MEMORY_BYTES: usize = mb(192);
 pub const BROWSER_PROCESS_MEMORY_BYTES: usize = mb(2_048);
 
+pub const WEBVIEW_HOST_PROCESS_MEMORY_BYTES: usize = mb(256);
+pub const WEBVIEW_LIVE_TAB_BUDGET_BYTES: usize = mb(256);
+pub const WEBVIEW_USER_DATA_MAX_MB: u32 = 256;
+pub const WEBVIEW_MAX_LIVE_FOREGROUND: usize = 1;
+pub const WEBVIEW_MAX_CONCURRENT_CONTROLLERS: usize = 4;
+
 pub const IPC_MESSAGE_BYTES: usize = 4 * MB;
 pub const IPC_CHUNK_BYTES: usize = 512 * KB;
 pub const RENDERER_KEEP_MIN_PROCESSES: usize = 1;
@@ -128,6 +138,7 @@ mod tests {
             SUBSYSTEM_GPU_MB,
             SUBSYSTEM_WORKER_IPC_MB,
             SUBSYSTEM_STORAGE_WRITE_MB,
+            SUBSYSTEM_WEBVIEW_MB,
         ];
         for ceiling in ceilings {
             assert!(
@@ -182,12 +193,25 @@ mod tests {
     }
 
     #[test]
+    fn webview_composite_budget_is_ordered_and_within_limits() {
+        assert!(GLOBAL_SOFT_LIMIT_MB < GLOBAL_SOFT_WITH_WEBVIEW_MB);
+        assert!(GLOBAL_HARD_LIMIT_MB < GLOBAL_HARD_WITH_WEBVIEW_MB);
+        assert!(GLOBAL_SOFT_WITH_WEBVIEW_MB < GLOBAL_HARD_WITH_WEBVIEW_MB);
+        assert!(mb(SUBSYSTEM_WEBVIEW_MB) <= mb(GLOBAL_HARD_WITH_WEBVIEW_MB));
+        assert!(WEBVIEW_HOST_PROCESS_MEMORY_BYTES < mb(GLOBAL_HARD_WITH_WEBVIEW_MB));
+        assert!(WEBVIEW_LIVE_TAB_BUDGET_BYTES >= DOM_TRANSFER_TOTAL_BYTES);
+        assert!(WEBVIEW_MAX_LIVE_FOREGROUND <= WEBVIEW_MAX_CONCURRENT_CONTROLLERS);
+        assert!(WEBVIEW_USER_DATA_MAX_MB <= GLOBAL_HARD_WITH_WEBVIEW_MB);
+    }
+
+    #[test]
     fn the_job_object_ceiling_sits_above_the_governance_threshold() {
         for threshold in [
             RENDERER_PROCESS_MEMORY_BYTES,
             NETWORK_PROCESS_MEMORY_BYTES,
             MEDIA_PROCESS_MEMORY_BYTES,
             GPU_PROCESS_MEMORY_BYTES,
+            WEBVIEW_HOST_PROCESS_MEMORY_BYTES,
         ] {
             let ceiling = job_memory_limit_bytes(threshold);
             assert!(

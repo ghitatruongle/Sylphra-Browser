@@ -59,6 +59,14 @@ pub use windows_integration::{
     WindowsIntegration,
 };
 
+pub use compat_backend::{
+    BackendPreference, BackendRouter, CompatibilitySignals, RenderBackend, WebView2HostPolicy,
+};
+
+pub use compat_governance::{webview_ceiling_bytes, CompatLoadReport, ProcessTree};
+
+pub use compat_session::CompatSession;
+
 pub use app_platform::{
     ApplicationDocument, CustomElementDefinition, CustomElementRegistry, HydrationReport,
     LifecycleKind, LifecycleRecord, ShadowMode, SlotAssignment,
@@ -160,6 +168,10 @@ pub struct Browser {
 
     pub renderer_fallback: bool,
 
+    pub compat: compat_session::CompatSession,
+
+    pub backend_router: compat_backend::BackendRouter,
+
     pub extension_manager: extensions::ExtensionManager,
 
     pub app_manager: installed_app::InstalledAppManager,
@@ -239,6 +251,10 @@ impl Browser {
             ),
         };
 
+        let webview_user_data = storage
+            .storage_dir()
+            .map(|dir| dir.join("webview2").display().to_string());
+
         Self {
             tabs: TabManager::new(),
             viewport_width: 1100,
@@ -273,6 +289,8 @@ impl Browser {
             ),
             process_coordinator: None,
             renderer_fallback: false,
+            compat: compat_session::CompatSession::with_user_data(webview_user_data),
+            backend_router: compat_backend::BackendRouter::default(),
             extension_manager,
             app_manager,
             updater,
@@ -361,6 +379,7 @@ impl Browser {
             if let Some(tab) = self.tabs.get_tab_mut(id) {
                 tab.discard();
             }
+            self.close_compat_surface(id);
             self.resources
                 .release_owner(resource_ledger::OwnerId::Tab(id));
         }
@@ -372,6 +391,125 @@ impl Browser {
             ));
         }
         notes
+    }
+
+    pub fn set_backend_preference(&mut self, preference: compat_backend::BackendPreference) {
+        self.backend_router = compat_backend::BackendRouter::default()
+            .with_preference(preference)
+            .with_compat_available(self.compat_fallback_available());
+    }
+
+    pub fn backend_preference(&self) -> compat_backend::BackendPreference {
+        self.backend_router.preference()
+    }
+
+    pub fn compat_fallback_available(&self) -> bool {
+        self.compat.availability().is_none()
+    }
+
+    pub fn choose_backend(
+        &self,
+        signals: &compat_backend::CompatibilitySignals,
+    ) -> compat_backend::RenderBackend {
+        self.backend_router
+            .with_compat_available(self.compat_fallback_available())
+            .choose(signals)
+    }
+
+    pub fn backend_allows_compat_fallback(&self) -> bool {
+        let signals = compat_backend::CompatibilitySignals {
+            renderer_fallback: self.renderer_fallback,
+            probe_failed: true,
+            ..compat_backend::CompatibilitySignals::default()
+        };
+        self.choose_backend(&signals) == compat_backend::RenderBackend::CompatWebview
+    }
+
+    pub fn request_compat_for_active_tab(&mut self) -> String {
+        let active = self
+            .active_tab()
+            .map(|tab| (tab.id, tab.url.clone(), tab.incognito));
+        let config = self.adblocker.config().clone();
+        match active {
+            Some((tab_id, url, incognito)) => {
+                if self.backend_preference() == compat_backend::BackendPreference::ForceNative {
+                    return "compat: the native backend is pinned for this session".to_string();
+                }
+                self.compat.toggle_tab(tab_id, &url, incognito, config)
+            }
+            None => "compat: no active tab".to_string(),
+        }
+    }
+
+    pub fn tick_compat(&mut self) -> Vec<String> {
+        let notes = self.compat.tick();
+        let report = self.compat.load_report();
+        self.resources.reconcile(
+            resource_ledger::SubsystemId::WebView,
+            resource_ledger::OwnerId::Global,
+            report.measured_bytes as usize,
+        );
+        notes
+    }
+
+    pub fn compat_active(&self) -> bool {
+        self.compat.is_active()
+    }
+
+    pub fn compat_pending(&self) -> bool {
+        self.compat.is_pending()
+    }
+
+    pub fn open_compat(
+        &mut self,
+        tab_id: usize,
+        url: &str,
+        incognito: bool,
+        config: crate::adblock::AdBlockConfig,
+    ) -> String {
+        self.compat.request_tab(tab_id, url, incognito, config)
+    }
+
+    pub fn compat_active_for(&self, tab_id: usize) -> bool {
+        self.compat.is_tab_active(tab_id)
+    }
+
+    pub fn sync_compat_visibility(&mut self) {
+        let active = self.active_tab().map(|tab| tab.id);
+        self.compat.set_active_tab(active);
+    }
+
+    pub fn refresh_compat_bounds(&mut self) {
+        self.compat.refresh_bounds();
+    }
+
+    pub fn apply_compat_pressure(&mut self) -> Vec<String> {
+        if !self.compat.is_active() {
+            return Vec::new();
+        }
+        let report = self.compat.load_report();
+        self.compat.apply_pressure(report)
+    }
+
+    pub fn close_compat_surface(&mut self, tab_id: usize) {
+        self.compat.close_tab(tab_id);
+        if !self.compat.is_active() {
+            self.resources.forget_reconciled(
+                resource_ledger::SubsystemId::WebView,
+                resource_ledger::OwnerId::Global,
+            );
+        }
+    }
+
+    pub fn reload_compat_surface(&mut self, tab_id: usize) -> String {
+        self.compat.reload_tab(tab_id)
+    }
+
+    pub fn navigate_compat_surface(&mut self, tab_id: usize, url: &str) -> Option<String> {
+        if !self.compat.is_tab_active(tab_id) {
+            return None;
+        }
+        Some(self.compat.navigate_tab(tab_id, url))
     }
 
     pub fn poll_renderer_memory(&mut self) -> Vec<String> {
@@ -823,6 +961,7 @@ impl Browser {
             let id = tab.id;
             if let Some(t) = self.tabs.get_tab_mut(id) {
                 t.sleep();
+                self.close_compat_surface(id);
                 return Some(id);
             }
         }
@@ -857,10 +996,17 @@ impl Browser {
     }
 
     pub fn memory_budget(&self) -> memory_tracker::MemoryBudget {
-        memory_tracker::MemoryBudget::from_mb(
-            self.storage.settings.memory_soft_limit_mb,
-            self.storage.settings.memory_pressure_threshold_mb,
-        )
+        let soft_mb = self.storage.settings.memory_soft_limit_mb;
+        let hard_mb = self.storage.settings.memory_pressure_threshold_mb;
+        if self.compat_active() {
+            let extra_soft = compat_governance::webview_soft_headroom_mb();
+            let extra_hard = compat_governance::webview_hard_headroom_mb();
+            return memory_tracker::MemoryBudget::from_mb(
+                soft_mb.saturating_add(extra_soft),
+                hard_mb.saturating_add(extra_hard),
+            );
+        }
+        memory_tracker::MemoryBudget::from_mb(soft_mb, hard_mb)
     }
 
     pub fn pressure_status(&mut self) -> memory_tracker::PressureReading {
@@ -868,7 +1014,11 @@ impl Browser {
         let sample = memory_probe::sample();
         self.resources
             .note_main_working_set(sample.process_working_set_bytes);
-        let consumed = self.estimate_memory().total_bytes;
+        let webview_bytes = self.compat.committed_bytes() as usize;
+        let consumed = self
+            .estimate_memory()
+            .total_bytes
+            .saturating_add(webview_bytes);
         self.pressure.observe(budget, consumed, sample.system)
     }
 
@@ -1140,6 +1290,7 @@ impl Browser {
                 Some(tab) => tab.sleep(),
                 None => break,
             };
+            self.close_compat_surface(tab_id);
             report.slept_tabs.push(tab_id);
             report.after_bytes = report.after_bytes.saturating_sub(freed);
             report.relief_passes += 1;
@@ -1166,6 +1317,7 @@ impl Browser {
                     Some(tab) => tab.discard(),
                     None => break,
                 };
+                self.close_compat_surface(tab_id);
                 self.resources
                     .release_owner(resource_ledger::OwnerId::Tab(tab_id));
                 report.discarded_tabs.push(tab_id);
@@ -1195,6 +1347,7 @@ impl Browser {
                         continue;
                     }
                     tab.discard();
+                    self.close_compat_surface(tab_id);
                     return Some(tab_id);
                 }
             }

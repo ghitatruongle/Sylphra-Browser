@@ -364,14 +364,11 @@ fn spawn_reply_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
         .name("native-child-ipc-reader".into())
         .spawn(move || {
             let mut reader = BufReader::new(stdout);
-            loop {
-                match read_bounded_line(&mut reader, crate::ipc::MAX_IPC_MESSAGE_BYTES) {
-                    Ok(Some(line)) => {
-                        if sender.send(line).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) | Err(_) => break,
+            while let Ok(Some(line)) =
+                read_bounded_line(&mut reader, crate::ipc::MAX_IPC_MESSAGE_BYTES)
+            {
+                if sender.send(line).is_err() {
+                    break;
                 }
             }
         });

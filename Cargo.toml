@@ -1,6 +1,6 @@
 [package]
 name = "sylphra"
-version = "0.0.0-beta1"
+version = "0.0.0-beta2"
 edition = "2021"
 authors = ["Sylphra"]
 description = "A lightweight document-focused browser written in safe Rust"
@@ -15,6 +15,7 @@ categories = ["gui", "web-programming"]
 [features]
 default = []
 renderer-memory-harness = []
+compat-webview2 = ["dep:webview2-com", "dep:windows_wv2"]
 
 [dependencies]
 iced = { version = "0.12", default-features = false, features = ["tokio", "image", "canvas", "system"] }
@@ -74,6 +75,15 @@ windows = { version = "0.52", features = [
 wgpu = { version = "0.19.4", default-features = false, features = ["dx12", "wgsl"] }
 pollster = "1.0.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
+webview2-com = { version = "0.33", optional = true }
+windows_wv2 = { package = "windows", version = "0.58", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 winres = "0.1"

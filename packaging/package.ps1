@@ -8,6 +8,17 @@ if (-not $dist.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase)) 
     throw "Refusing to package outside the project directory: $dist"
 }
 
+function Get-WebViewLoaderArchitecture {
+    $hostLine = (& rustc -Vv | Select-String -Pattern "^host: ").Line
+    $triple = if ($hostLine) { $hostLine.Replace("host: ", "").Trim() } else { "" }
+    switch -Regex ($triple) {
+        "^aarch64" { return "arm64" }
+        "^i686" { return "x86" }
+        "^x86_64" { return "x64" }
+        default { return "x64" }
+    }
+}
+
 function Assert-ProductVersion {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -33,7 +44,7 @@ try {
     $version = $package.version
 
     if (-not $SkipBuild) {
-        cargo build --release --locked -j 1
+        cargo build --release --locked -j 1 --features compat-webview2
         if ($LASTEXITCODE -ne 0) {
             throw "Release build failed."
         }
@@ -48,6 +59,16 @@ try {
         Assert-ProductVersion -Path $binary -ExpectedVersion $version
     }
 
+    $loaderArchitecture = Get-WebViewLoaderArchitecture
+    $webviewLoader = Get-ChildItem -Path (Join-Path $projectRoot "target\release\build") `
+        -Recurse -Filter "WebView2Loader.dll" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -eq $loaderArchitecture } | Select-Object -First 1
+    if (-not $webviewLoader) {
+        throw "WebView2Loader.dll for '$loaderArchitecture' is missing from the release build output. Build with 'cargo build --release --locked -j 1 --features compat-webview2'; the compatibility backend needs it beside sylphra.exe at runtime."
+    }
+    $stagedLoader = Join-Path $projectRoot "target\release\WebView2Loader.dll"
+    Copy-Item -LiteralPath $webviewLoader.FullName -Destination $stagedLoader -Force
+
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
     $stage = Join-Path $dist "Sylphra-v$version-windows-x64"
     if (Test-Path -LiteralPath $stage) {
@@ -58,6 +79,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot "target\release\sylphra.exe") -Destination (Join-Path $stage "sylphra.exe")
     Copy-Item -LiteralPath (Join-Path $projectRoot "target\release\sylphra-renderer-worker.exe") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "target\release\sylphra-browser-child.exe") -Destination $stage
+    Copy-Item -LiteralPath $stagedLoader -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "assets\icon.ico") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSE") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY_NOTICES.md") -Destination $stage

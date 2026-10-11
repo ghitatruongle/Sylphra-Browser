@@ -72,13 +72,15 @@ try {
 
     $env:CARGO_BUILD_JOBS = "1"
     $env:CARGO_INCREMENTAL = "0"
-    # 32 MB: rustc worker threads overflowed the smaller 16 MB stack while
-    # compiling the larger integration-test crates on low-RAM machines.
-    $env:RUST_MIN_STACK = "33554432"
+    # 64 MB: on top of the larger integration-test crates, rustc worker threads
+    # need extra stack to codegen the WebView2 COM bindings (compat-webview2);
+    # the older 32 MB value overflowed during full rlib/binary codegen.
+    $env:RUST_MIN_STACK = "67108864"
 
     if ($Tier -in @("fast", "release")) {
         Invoke-Checked "Formatting" { cargo fmt --all -- --check }
         Invoke-Checked "Library tests" { cargo test --lib --locked -j 1 }
+        Invoke-Checked "Compatibility backend tests" { cargo test --lib --features compat-webview2 --locked -j 1 }
     }
 
     if ($Tier -eq "release") {
@@ -89,7 +91,7 @@ try {
         Invoke-Checked "Storage suite" { cargo test --test storage --locked -j 1 }
         Invoke-Checked "UI suite" { cargo test --test ui --locked -j 1 }
         Invoke-Checked "Platform suite" { cargo test --test platform --locked -j 1 }
-        Invoke-Checked "Release build" { cargo build --release --locked -j 1 }
+        Invoke-Checked "Release build" { cargo build --release --locked -j 1 --features compat-webview2 }
         Invoke-Checked "Release smoke" { & (Join-Path $projectRoot "tools\release-smoke.ps1") }
         if ($Package) {
             Invoke-Checked "Release packaging" { & (Join-Path $projectRoot "packaging\package.ps1") -SkipBuild }
