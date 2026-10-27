@@ -299,12 +299,19 @@ fn should_auto_close_parent(parent_tag: &str, child_tag: &str) -> bool {
     )
 }
 
+pub(crate) fn bounded_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 pub fn parse_html(html: &str) -> Element {
-    let html = if html.len() > MAX_HTML_BYTES {
-        &html[..MAX_HTML_BYTES]
-    } else {
-        html
-    };
+    let html = bounded_prefix(html, MAX_HTML_BYTES);
     let html = html.trim();
     if html.is_empty() {
         let mut body = Element::new("body");
@@ -593,11 +600,18 @@ pub fn parse_html(html: &str) -> Element {
 
                     match end_pos {
                         Some(end) => {
-                            let mut raw_text: String = chars[pos..end].iter().collect();
-                            if raw_text.len() > MAX_RAW_TEXT_LEN {
-                                raw_text.truncate(MAX_RAW_TEXT_LEN);
+                            let raw_chars = &chars[pos..end];
+                            let mut take = 0usize;
+                            let mut taken_bytes = 0usize;
+                            while take < raw_chars.len() {
+                                let next = taken_bytes + raw_chars[take].len_utf8();
+                                if next > MAX_RAW_TEXT_LEN {
+                                    break;
+                                }
+                                taken_bytes = next;
+                                take += 1;
                             }
-                            elem.text = raw_text;
+                            elem.text = raw_chars[..take].iter().collect();
                             pos = end + close_len;
                         }
                         None => {
@@ -686,6 +700,30 @@ mod tests {
         let dom = parse_html(html);
         assert!(dom.find_tag("h1").is_some());
         assert_eq!(dom.find_tag("h1").unwrap().text, "Hello");
+    }
+
+    #[test]
+    fn bounded_prefix_stops_on_char_boundary() {
+        let text = "aé中\u{1F600}".repeat(64);
+        for max in 0..=text.len() {
+            let cut = bounded_prefix(&text, max);
+            assert!(cut.len() <= max);
+            assert!(text.is_char_boundary(cut.len()));
+            assert!(text.starts_with(cut));
+        }
+    }
+
+    #[test]
+    fn raw_text_over_budget_is_cut_on_char_boundary() {
+        let mut html = String::from("<script>x");
+        html.push_str(&"é".repeat(1_100_000));
+        html.push_str("</script><p id=after>ok</p>");
+        let dom = parse_html(&html);
+        let script = dom
+            .find_tag("script")
+            .expect("script element must survive truncation");
+        assert!(script.text.len() <= MAX_RAW_TEXT_LEN);
+        assert!(dom.find_tag("p").is_some());
     }
 
     #[test]

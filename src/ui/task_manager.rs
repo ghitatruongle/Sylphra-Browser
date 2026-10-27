@@ -73,6 +73,9 @@ pub struct TaskManager {
     pub open: bool,
     pub tasks: Vec<ProcessTaskInfo>,
     pub summary: GovernanceSummary,
+    pub estimated_total_mb: f32,
+    pub image_cache_mb: f32,
+    pub resource_cache_mb: f32,
 }
 
 impl TaskManager {
@@ -81,6 +84,9 @@ impl TaskManager {
             open: false,
             tasks: Vec::new(),
             summary: GovernanceSummary::default(),
+            estimated_total_mb: 0.0,
+            image_cache_mb: 0.0,
+            resource_cache_mb: 0.0,
         }
     }
 

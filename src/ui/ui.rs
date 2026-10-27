@@ -687,8 +687,11 @@ pub struct SylphraApp {
 
     load_seq: u64,
     pending_loads: HashMap<usize, u64>,
+    pending_prepares: HashMap<usize, u64>,
 
     pending_image_batches: HashMap<usize, u64>,
+    find_match_cache: std::cell::RefCell<(usize, String, Option<usize>)>,
+    suggestions_cache: std::cell::RefCell<(String, SuggestionMatches)>,
     load_cancellations: HashMap<usize, crate::network_scheduler::CancellationToken>,
 
     #[cfg(target_os = "windows")]
@@ -717,6 +720,8 @@ pub struct SylphraApp {
 }
 
 pub type GhitaBrowserApp = SylphraApp;
+
+type SuggestionMatches = Vec<(String, String, &'static str)>;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -854,6 +859,24 @@ pub enum Message {
         tab_id: usize,
         seq: u64,
     },
+    PagePrepared {
+        tab_id: usize,
+        seq: u64,
+        url: String,
+        html: String,
+        binary_len: usize,
+        fetch_time: u64,
+        incognito: bool,
+        is_pdf: bool,
+        is_youtube_route: bool,
+        child_render_requested: bool,
+        document_rules: Vec<crate::css_parser::CssRule>,
+        outcome: Result<Box<crate::document::PreparedDocument>, String>,
+        renderer_fallback: bool,
+    },
+    TabSpillsCommitted {
+        outcomes: Vec<crate::TabSpillOutcome>,
+    },
     LoadError {
         err: String,
         url: String,
@@ -914,7 +937,10 @@ impl Application for SylphraApp {
             search_state: HashMap::new(),
             load_seq: 0,
             pending_loads: HashMap::new(),
+            pending_prepares: HashMap::new(),
             pending_image_batches: HashMap::new(),
+            find_match_cache: std::cell::RefCell::new((0, String::new(), None)),
+            suggestions_cache: std::cell::RefCell::new((String::new(), Vec::new())),
             load_cancellations: HashMap::new(),
             #[cfg(target_os = "windows")]
             youtube_playback: None,
@@ -1399,8 +1425,11 @@ impl Application for SylphraApp {
                     }
                 }
             }
-            Message::SelectTab(index) => {
+            Message::SelectTab(tab_id) => {
                 self.tab_search_open = false;
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
 
                 if let Some(tab) = self.browser.tabs.get_tab_by_index(index) {
                     let tab_id = tab.id;
@@ -1493,7 +1522,10 @@ impl Application for SylphraApp {
                     log::info!("Evicted {} stale images from cache", evicted);
                 }
             }
-            Message::WakeTab(index) => {
+            Message::WakeTab(tab_id) => {
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
                 if let Some(tab) = self.browser.tabs.get_tab_by_index(index) {
                     let tab_id = tab.id;
                     match self.browser.wake_tab(tab_id) {
@@ -1529,19 +1561,10 @@ impl Application for SylphraApp {
                 tab_id,
                 seq,
             } => {
-                if self.pending_loads.get(&tab_id) != Some(&seq) {
-                    for data in images {
-                        self.browser.image_cache.add(
-                            data.url.clone(),
-                            crate::image_loader::Image::new(&data.url, data.width, data.height)
-                                .with_alt(""),
-                        );
-                        self.browser
-                            .image_cache
-                            .insert_decoded(data.url.clone(), std::sync::Arc::new(data));
-                    }
+                if self.pending_image_batches.get(&tab_id) != Some(&seq) {
                     return Command::none();
                 }
+                self.pending_image_batches.remove(&tab_id);
                 let batch_is_active = self.browser.tabs.active_tab_id() == Some(tab_id);
 
                 for data in images {
@@ -1573,7 +1596,10 @@ impl Application for SylphraApp {
                 }
                 self.status_msg = "Incognito tab opened — history will not be saved".to_string();
             }
-            Message::CloseTab(index) => {
+            Message::CloseTab(tab_id) => {
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
                 if let Some(tab) = self.browser.tabs.get_tab_by_index(index) {
                     let id = tab.id;
                     if let Some(cancellation) = self.load_cancellations.remove(&id) {
@@ -1586,6 +1612,8 @@ impl Application for SylphraApp {
                     self.task_manager.tasks.retain(|task| task.tab_id != id);
                     self.search_state.remove(&id);
                     self.pending_loads.remove(&id);
+                    self.pending_prepares.remove(&id);
+                    self.pending_image_batches.remove(&id);
                     self.ensure_tab();
                     return self.after_tab_change("Tab closed");
                 }
@@ -1603,6 +1631,8 @@ impl Application for SylphraApp {
                     self.task_manager.tasks.retain(|task| task.tab_id != id);
                     self.search_state.remove(&id);
                     self.pending_loads.remove(&id);
+                    self.pending_prepares.remove(&id);
+                    self.pending_image_batches.remove(&id);
                     self.ensure_tab();
                     return self.after_tab_change("Tab closed");
                 }
@@ -1630,7 +1660,10 @@ impl Application for SylphraApp {
                     return self.after_tab_change("");
                 }
             }
-            Message::PinTab(index) => {
+            Message::PinTab(tab_id) => {
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
                 let pinned = self
                     .browser
                     .tabs
@@ -1645,7 +1678,10 @@ impl Application for SylphraApp {
                     };
                 }
             }
-            Message::ToggleMuteTab(index) => {
+            Message::ToggleMuteTab(tab_id) => {
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
                 if let Some(muted) = self.browser.tabs.toggle_mute_by_index(index) {
                     self.browser.persist_session();
                     self.status_msg = if muted {
@@ -1655,7 +1691,10 @@ impl Application for SylphraApp {
                     };
                 }
             }
-            Message::ToggleTabGroup(index) => {
+            Message::ToggleTabGroup(tab_id) => {
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
                 let current = self
                     .browser
                     .tabs
@@ -1685,12 +1724,18 @@ impl Application for SylphraApp {
                     };
                 }
             }
-            Message::MoveTabLeft(index) => {
+            Message::MoveTabLeft(tab_id) => {
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
                 if index > 0 && self.browser.tabs.reorder_tab(index, index - 1) {
                     self.browser.persist_session();
                 }
             }
-            Message::MoveTabRight(index) => {
+            Message::MoveTabRight(tab_id) => {
+                let Some(index) = self.browser.tabs.index_of(tab_id) else {
+                    return Command::none();
+                };
                 if index + 1 < self.browser.tab_count()
                     && self.browser.tabs.reorder_tab(index, index + 1)
                 {
@@ -1949,12 +1994,17 @@ impl Application for SylphraApp {
                 self.js_input_text = code;
             }
             Message::ExecuteJs => {
+                const MAX_DEVTOOLS_CODE_BYTES: usize = 256 * 1024;
+                const DEVTOOLS_STEP_BUDGET: u64 = 200_000;
                 let code = self.js_input_text.clone();
                 if !code.is_empty() {
                     let mut repaint_page = false;
-                    let result = if let Some(tab) = self.browser.tabs.active_tab_mut() {
+                    let result = if code.len() > MAX_DEVTOOLS_CODE_BYTES {
+                        Err("Script exceeds the 256 KiB devtools limit".to_string())
+                    } else if let Some(tab) = self.browser.tabs.active_tab_mut() {
                         if tab.runtime.is_some() {
-                            let result = tab.evaluate_js(&code);
+                            let result =
+                                tab.evaluate_js_with_step_limit(&code, DEVTOOLS_STEP_BUDGET);
                             if let Some(runtime) = tab.runtime.as_mut() {
                                 let render = runtime.refresh_render().clone();
                                 tab.set_dom(render.dom);
@@ -1963,10 +2013,14 @@ impl Application for SylphraApp {
                             }
                             result
                         } else {
-                            self.browser.js_engine.execute_script(&code)
+                            self.browser
+                                .js_engine
+                                .eval_with_step_limit(&code, DEVTOOLS_STEP_BUDGET)
                         }
                     } else {
-                        self.browser.js_engine.execute_script(&code)
+                        self.browser
+                            .js_engine
+                            .eval_with_step_limit(&code, DEVTOOLS_STEP_BUDGET)
                     };
 
                     match result {
@@ -2163,28 +2217,121 @@ impl Application for SylphraApp {
                     && !is_youtube_route
                     && url::Url::parse(&url)
                         .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"));
-                let prepared = match child_render_requested.then(|| {
-                    self.browser
-                        .render_document_in_child(tab_id, &url, &html, &document_rules)
-                }) {
-                    Some(Some(prepared)) => prepared,
-                    _ => match self.prepare_document_off_thread(
-                        result.binary_body.as_deref(),
-                        &html,
-                        &url,
-                        &document_rules,
-                    ) {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            return self.update(Message::LoadError {
-                                err: format!("Document worker failed: {error}"),
-                                url,
-                                tab_id,
-                                seq,
-                            });
-                        }
+                let binary_len = result.binary_body.as_ref().map_or(0, Vec::len);
+                let coordinator = self.browser.process_coordinator.clone();
+                let ledger = self.browser.resources.clone();
+                let viewport_width = self.browser.viewport_width();
+                let viewport_height = self.browser.viewport_height();
+                let prepare_url = url.clone();
+                let prepare_html = html.clone();
+                let prepare_pdf = result.binary_body.clone();
+                let prepare_rules = document_rules.clone();
+                self.pending_prepares.insert(tab_id, seq);
+                return Command::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let child = if child_render_requested {
+                                coordinator.as_ref().and_then(|coordinator| {
+                                    Browser::render_document_in_child(
+                                        coordinator,
+                                        &ledger,
+                                        tab_id,
+                                        &prepare_url,
+                                        &prepare_html,
+                                        &prepare_rules,
+                                        viewport_width,
+                                        viewport_height,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            match child {
+                                Some(prepared) => (Some(prepared), false),
+                                None => {
+                                    let child_attempted =
+                                        child_render_requested && coordinator.is_some();
+                                    let outcome = match prepare_pdf.as_deref() {
+                                        Some(pdf_bytes) => crate::worker::prepare_pdf_isolated(
+                                            pdf_bytes,
+                                            &prepare_url,
+                                            &prepare_rules,
+                                            viewport_width,
+                                            viewport_height,
+                                        )
+                                        .map_err(|error| error.to_string()),
+                                        None => crate::worker::prepare_document_isolated(
+                                            &prepare_html,
+                                            &prepare_url,
+                                            &prepare_rules,
+                                            viewport_width,
+                                            viewport_height,
+                                        )
+                                        .map_err(|error| error.to_string()),
+                                    };
+                                    (outcome.ok(), child_attempted)
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            log::warn!("document prepare task failed: {error}");
+                            (None, true)
+                        })
                     },
+                    move |(prepared, renderer_fallback)| Message::PagePrepared {
+                        tab_id,
+                        seq,
+                        url,
+                        html,
+                        binary_len,
+                        fetch_time,
+                        incognito,
+                        is_pdf,
+                        is_youtube_route,
+                        child_render_requested,
+                        document_rules,
+                        outcome: match prepared {
+                            Some(prepared) => Ok(Box::new(prepared)),
+                            None => Err("document preparation failed".to_string()),
+                        },
+                        renderer_fallback,
+                    },
+                );
+            }
+            Message::PagePrepared {
+                tab_id,
+                seq,
+                url,
+                html,
+                binary_len,
+                fetch_time,
+                incognito,
+                is_pdf,
+                is_youtube_route,
+                child_render_requested,
+                document_rules,
+                outcome,
+                renderer_fallback,
+            } => {
+                if self.pending_prepares.get(&tab_id) != Some(&seq) {
+                    return Command::none();
+                }
+                self.pending_prepares.remove(&tab_id);
+                let prepared = match outcome {
+                    Ok(prepared) => *prepared,
+                    Err(error) => {
+                        return self.update(Message::LoadError {
+                            err: format!("Document worker failed: {error}"),
+                            url,
+                            tab_id,
+                            seq,
+                        });
+                    }
                 };
+                if child_render_requested {
+                    self.browser.renderer_fallback = renderer_fallback;
+                }
                 let stats = prepared.stats.clone();
                 let parse_time = stats.parse_time_ms;
                 let style_time = stats.style_time_ms;
@@ -2202,12 +2349,8 @@ impl Application for SylphraApp {
                 ] {
                     self.browser.profiler.record(phase, duration);
                 }
-                let estimated_document_bytes = result
-                    .binary_body
-                    .as_ref()
-                    .map(Vec::len)
-                    .unwrap_or(html.len())
-                    .saturating_add(dom_nodes.saturating_mul(512));
+                let estimated_document_bytes =
+                    binary_len.saturating_add(dom_nodes.saturating_mul(512));
                 let performance_evaluation = crate::performance::PerformanceBudget::default()
                     .evaluate(crate::performance::NavigationMetrics {
                         fetch_ms: fetch_time,
@@ -2289,9 +2432,10 @@ impl Application for SylphraApp {
                     if let Ok(parsed) = url::Url::parse(&url) {
                         if matches!(parsed.scheme(), "http" | "https") {
                             let origin = parsed.origin().ascii_serialization();
-                            let storage = self.browser.storage.local_storage(&origin);
-                            for (key, value) in &runtime.storage_writes {
-                                let _ = storage.set(key, value);
+                            if let Some(storage) = self.browser.storage.local_storage(&origin) {
+                                for (key, value) in &runtime.storage_writes {
+                                    let _ = storage.set(key, value);
+                                }
                             }
                         }
                     }
@@ -2337,7 +2481,7 @@ impl Application for SylphraApp {
                     return Command::none();
                 }
 
-                self.observe_navigation_memory();
+                let spill_command = self.observe_navigation_memory();
 
                 if !incognito {
                     self.browser.storage.add_history(&url, &title);
@@ -2568,7 +2712,17 @@ impl Application for SylphraApp {
                     self.show_suggestions = false;
                     self.url_input = url.clone();
 
-                    return self.schedule_image_loading();
+                    return Command::batch([self.schedule_image_loading(), spill_command]);
+                }
+            }
+            Message::TabSpillsCommitted { outcomes } => {
+                let mut freed = 0usize;
+                for outcome in outcomes {
+                    freed = freed.saturating_add(self.browser.commit_tab_spill(outcome));
+                }
+                if freed > 0 {
+                    self.browser.sync_tab_budgets();
+                    log::info!("memory relief spilled {freed} bytes off the interface thread");
                 }
             }
             Message::LoadError {
@@ -2580,6 +2734,8 @@ impl Application for SylphraApp {
                 if self.pending_loads.get(&tab_id) != Some(&seq) {
                     return Command::none();
                 }
+                self.pending_prepares.remove(&tab_id);
+                self.pending_image_batches.remove(&tab_id);
                 self.load_cancellations.remove(&tab_id);
                 self.is_loading = false;
                 let (title, friendly_msg) = humanize_error(&err);
@@ -2952,6 +3108,7 @@ impl SylphraApp {
             let seq = self.load_seq;
             self.pending_loads.insert(tab_id, seq);
             self.pending_image_batches.remove(&tab_id);
+            self.pending_prepares.remove(&tab_id);
         }
     }
 
@@ -2972,6 +3129,7 @@ impl SylphraApp {
         let seq = self.load_seq;
         self.pending_loads.insert(tab_id, seq);
         self.pending_image_batches.remove(&tab_id);
+        self.pending_prepares.remove(&tab_id);
         if let Some(previous) = self.load_cancellations.remove(&tab_id) {
             previous.cancel();
         }
@@ -3039,6 +3197,7 @@ impl SylphraApp {
         let seq = self.load_seq;
         self.pending_loads.insert(tab_id, seq);
         self.pending_image_batches.remove(&tab_id);
+        self.pending_prepares.remove(&tab_id);
         if let Some(previous) = self.load_cancellations.remove(&tab_id) {
             previous.cancel();
         }
@@ -3135,6 +3294,7 @@ impl SylphraApp {
         let seq = self.load_seq;
         self.pending_loads.insert(tab_id, seq);
         self.pending_image_batches.remove(&tab_id);
+        self.pending_prepares.remove(&tab_id);
         if let Some(previous) = self.load_cancellations.remove(&tab_id) {
             previous.cancel();
         }
@@ -3399,38 +3559,69 @@ impl SylphraApp {
         self.schedule_image_loading()
     }
 
-    fn observe_navigation_memory(&mut self) {
+    fn observe_navigation_memory(&mut self) -> Command<Message> {
         self.browser.sync_tab_budgets();
-        self.browser.enforce_tab_budgets();
+        let jobs = self.browser.collect_tab_spill_jobs();
+        let spill_command = if jobs.is_empty() {
+            Command::none()
+        } else {
+            Command::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        jobs.into_iter()
+                            .map(|job| match crate::tab::spill_payload_for_dom(&job.dom) {
+                                Ok(payload) => {
+                                    let path = if job.to_disk {
+                                        std::fs::create_dir_all(&job.directory).ok();
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher =
+                                            std::collections::hash_map::DefaultHasher::new();
+                                        job.url.hash(&mut hasher);
+                                        let path = job.directory.join(format!(
+                                            "tab-{}-{:016x}.gz",
+                                            job.tab_id,
+                                            hasher.finish()
+                                        ));
+                                        crate::fs_atomic::atomic_write_bytes(&path, &payload)
+                                            .ok()
+                                            .map(|()| path.to_string_lossy().into_owned())
+                                    } else {
+                                        None
+                                    };
+                                    crate::TabSpillOutcome {
+                                        tab_id: job.tab_id,
+                                        to_disk: job.to_disk,
+                                        ok: !job.to_disk || path.is_some(),
+                                        path,
+                                        payload: if job.to_disk { Vec::new() } else { payload },
+                                    }
+                                }
+                                Err(_) => crate::TabSpillOutcome {
+                                    tab_id: job.tab_id,
+                                    to_disk: job.to_disk,
+                                    ok: false,
+                                    path: None,
+                                    payload: Vec::new(),
+                                },
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_default()
+                },
+                move |outcomes| Message::TabSpillsCommitted { outcomes },
+            )
+        };
         let budget = self.browser.memory_budget();
         if !budget.is_enforced() {
-            return;
+            return spill_command;
         }
         let report = self.browser.relieve_memory_pressure(budget, 2);
         let status = format_memory_relief_status(&report);
         if !status.is_empty() {
             self.status_msg = status;
         }
-    }
-
-    fn prepare_document_off_thread(
-        &mut self,
-        pdf_bytes: Option<&[u8]>,
-        html: &str,
-        url: &str,
-        document_rules: &[crate::css_parser::CssRule],
-    ) -> Result<crate::document::PreparedDocument, String> {
-        let width = self.browser.viewport_width();
-        let height = self.browser.viewport_height();
-        match pdf_bytes {
-            Some(pdf_bytes) => {
-                crate::worker::prepare_pdf_isolated(pdf_bytes, url, document_rules, width, height)
-            }
-            None => {
-                crate::worker::prepare_document_isolated(html, url, document_rules, width, height)
-            }
-        }
-        .map_err(|error| error.to_string())
+        spill_command
     }
 
     fn refresh_task_manager(&mut self) {
@@ -3438,6 +3629,12 @@ impl SylphraApp {
             return;
         }
         let estimate = self.browser.estimate_memory();
+        self.task_manager.estimated_total_mb =
+            crate::memory_tracker::MemoryTracker::bytes_to_mb(estimate.total_bytes);
+        self.task_manager.image_cache_mb =
+            crate::memory_tracker::MemoryTracker::bytes_to_mb(estimate.image_cache_bytes);
+        self.task_manager.resource_cache_mb =
+            crate::memory_tracker::MemoryTracker::bytes_to_mb(estimate.resource_cache_bytes);
         let summary = self.browser.governance_summary();
         let committed = self.browser.committed_bytes_by_tab();
         let mut infos = Vec::new();
@@ -3592,8 +3789,8 @@ impl SylphraApp {
             .collect();
         let active_id = self.browser.tabs.active_tab_id();
 
-        for (i, (id, title, url, incognito, is_sleeping, is_discarded, pinned, muted, group_id)) in
-            tab_info.iter().enumerate()
+        for (id, title, url, incognito, is_sleeping, is_discarded, pinned, muted, group_id) in
+            tab_info.iter()
         {
             let is_active = Some(*id) == active_id;
 
@@ -3643,12 +3840,12 @@ impl SylphraApp {
             .align_items(iced::Alignment::Center);
 
             let tab_btn = button(label)
-                .on_press(Message::SelectTab(i))
+                .on_press(Message::SelectTab(*id))
                 .padding([6, 4, 6, 10])
                 .style(chrome_btn(bg, hover, txt, [8.0, 0.0, 0.0, 0.0]));
 
             let close_btn = button(text("✕").size(10))
-                .on_press(Message::CloseTab(i))
+                .on_press(Message::CloseTab(*id))
                 .padding([8, 8, 8, 4])
                 .style(chrome_btn(bg, hover, pal.text_dim, [0.0, 8.0, 0.0, 0.0]));
 
@@ -3657,19 +3854,19 @@ impl SylphraApp {
                 controls = controls
                     .push(
                         button(text(if *pinned { "U" } else { "P" }).size(9))
-                            .on_press(Message::PinTab(i))
+                            .on_press(Message::PinTab(*id))
                             .padding([8, 4])
                             .style(chrome_btn(bg, hover, pal.text_dim, [0.0; 4])),
                     )
                     .push(
                         button(text(if *muted { "A" } else { "M" }).size(9))
-                            .on_press(Message::ToggleMuteTab(i))
+                            .on_press(Message::ToggleMuteTab(*id))
                             .padding([8, 4])
                             .style(chrome_btn(bg, hover, pal.text_dim, [0.0; 4])),
                     )
                     .push(
                         button(text("G").size(9))
-                            .on_press(Message::ToggleTabGroup(i))
+                            .on_press(Message::ToggleTabGroup(*id))
                             .padding([8, 4])
                             .style(chrome_btn(bg, hover, pal.text_dim, [0.0; 4])),
                     );
@@ -3714,7 +3911,7 @@ impl SylphraApp {
         .spacing(4)
         .padding(8);
 
-        for (index, tab) in self.browser.tabs.iter_tabs().into_iter().enumerate() {
+        for tab in self.browser.tabs.iter_tabs().into_iter() {
             let active = Some(tab.id) == active_id;
             let bg = if active { pal.toolbar } else { pal.tab_strip };
             let marker = if tab.is_discarded {
@@ -3737,12 +3934,12 @@ impl SylphraApp {
             tabs = tabs.push(
                 row![
                     button(label)
-                        .on_press(Message::SelectTab(index))
+                        .on_press(Message::SelectTab(tab.id))
                         .padding([7, 8])
                         .width(Length::Fill)
                         .style(chrome_btn(bg, pal.tab_hover, pal.text, [6.0; 4])),
                     button(text("✕").size(10))
-                        .on_press(Message::CloseTab(index))
+                        .on_press(Message::CloseTab(tab.id))
                         .padding([7, 7])
                         .style(chrome_btn(bg, pal.tab_hover, pal.text_dim, [6.0; 4])),
                 ]
@@ -3792,7 +3989,7 @@ impl SylphraApp {
         ]
         .spacing(6);
 
-        for (index, tab) in self.browser.tabs.iter_tabs().into_iter().enumerate() {
+        for tab in self.browser.tabs.iter_tabs().into_iter() {
             if !query.is_empty()
                 && !tab.title.to_ascii_lowercase().contains(&query)
                 && !tab.url.to_ascii_lowercase().contains(&query)
@@ -3811,7 +4008,7 @@ impl SylphraApp {
                     ]
                     .spacing(12),
                 )
-                .on_press(Message::SelectTab(index))
+                .on_press(Message::SelectTab(tab.id))
                 .padding([6, 10])
                 .width(Length::Fill)
                 .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [5.0; 4])),
@@ -3834,16 +4031,15 @@ impl SylphraApp {
     }
 
     fn build_task_manager_panel(&self, pal: &'static Pal) -> Element<'_, Message> {
-        let memory = self.browser.estimate_memory();
         let soft = self.browser.storage.settings.memory_soft_limit_mb;
         let hard = self.browser.storage.settings.memory_pressure_threshold_mb;
         let summary = &self.task_manager.summary;
         let mut tasks = column![row![
             text(format!(
                 "Task Manager — {:.1} MB estimated (images {:.1}, resources {:.1}; budget {soft}/{hard} MB)",
-                crate::memory_tracker::MemoryTracker::bytes_to_mb(memory.total_bytes),
-                crate::memory_tracker::MemoryTracker::bytes_to_mb(memory.image_cache_bytes),
-                crate::memory_tracker::MemoryTracker::bytes_to_mb(memory.resource_cache_bytes),
+                self.task_manager.estimated_total_mb,
+                self.task_manager.image_cache_mb,
+                self.task_manager.resource_cache_mb,
             ))
             .size(14)
             .style(iced::theme::Text::from(pal.text)),
@@ -3942,12 +4138,6 @@ impl SylphraApp {
         }
 
         for task in &self.task_manager.tasks {
-            let index = self
-                .browser
-                .tabs
-                .iter_tabs()
-                .into_iter()
-                .position(|tab| tab.id == task.tab_id);
             let state = if task.is_discarded {
                 "discarded"
             } else if task.is_disk_backed {
@@ -3983,10 +4173,10 @@ impl SylphraApp {
             ]
             .spacing(8)
             .align_items(iced::Alignment::Center);
-            if let Some(index) = index {
+            if self.browser.tabs.get_tab(task.tab_id).is_some() {
                 task_row = task_row.push(
                     button(text("End task").size(10))
-                        .on_press(Message::CloseTab(index))
+                        .on_press(Message::CloseTab(task.tab_id))
                         .padding([4, 8])
                         .style(chrome_btn(pal.danger, pal.danger, pal.on_accent, [5.0; 4])),
                 );
@@ -3994,7 +4184,7 @@ impl SylphraApp {
             tasks = tasks.push(task_row);
         }
 
-        container(tasks)
+        container(scrollable(tasks).height(Length::Fixed(420.0)))
             .padding([10, 18])
             .width(Length::Fill)
             .style(move |_: &Theme| container::Appearance {
@@ -4173,6 +4363,37 @@ impl SylphraApp {
             .into()
     }
 
+    fn compute_suggestion_matches(
+        storage: &crate::storage::StorageManager,
+        q_lower: &str,
+    ) -> SuggestionMatches {
+        let mut seen: Vec<String> = Vec::new();
+        let mut matches: Vec<(String, String, &'static str)> = Vec::new();
+        for h in storage.history() {
+            if matches.len() >= 5 {
+                break;
+            }
+            if (h.url.to_lowercase().contains(q_lower) || h.title.to_lowercase().contains(q_lower))
+                && !seen.contains(&h.url)
+            {
+                seen.push(h.url.clone());
+                matches.push((h.title.clone(), h.url.clone(), "T"));
+            }
+        }
+        for b in storage.bookmarks() {
+            if matches.len() >= 6 {
+                break;
+            }
+            if (b.url.to_lowercase().contains(q_lower) || b.title.to_lowercase().contains(q_lower))
+                && !seen.contains(&b.url)
+            {
+                seen.push(b.url.clone());
+                matches.push((b.title.clone(), b.url.clone(), "★"));
+            }
+        }
+        matches
+    }
+
     fn build_suggestions(&self, pal: &'static Pal) -> Element<'_, Message> {
         let query = self.url_input.trim().to_string();
         let q_lower = query.to_lowercase();
@@ -4201,32 +4422,13 @@ impl SylphraApp {
             .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [0.0; 4])),
         );
 
-        let mut seen: Vec<String> = Vec::new();
-        let mut matches: Vec<(String, String, &'static str)> = Vec::new();
-        for h in self.browser.storage.history() {
-            if matches.len() >= 5 {
-                break;
-            }
-            if (h.url.to_lowercase().contains(&q_lower)
-                || h.title.to_lowercase().contains(&q_lower))
-                && !seen.contains(&h.url)
-            {
-                seen.push(h.url.clone());
-                matches.push((h.title.clone(), h.url.clone(), "T"));
-            }
+        let mut cache = self.suggestions_cache.borrow_mut();
+        if cache.0 != query {
+            let matches = Self::compute_suggestion_matches(&self.browser.storage, &q_lower);
+            *cache = (query.clone(), matches);
         }
-        for b in self.browser.storage.bookmarks() {
-            if matches.len() >= 6 {
-                break;
-            }
-            if (b.url.to_lowercase().contains(&q_lower)
-                || b.title.to_lowercase().contains(&q_lower))
-                && !seen.contains(&b.url)
-            {
-                seen.push(b.url.clone());
-                matches.push((b.title.clone(), b.url.clone(), "★"));
-            }
-        }
+        let matches = cache.1.clone();
+        drop(cache);
 
         for (title, url, icon) in matches {
             items = items.push(
@@ -4488,11 +4690,20 @@ impl SylphraApp {
         let match_count = if self.find_query.is_empty() {
             String::new()
         } else {
-            let n = self
-                .rendered_content
-                .to_lowercase()
-                .matches(&self.find_query.to_lowercase())
-                .count();
+            let mut cache = self.find_match_cache.borrow_mut();
+            if cache.0 != self.rendered_content.len() || cache.1 != self.find_query {
+                let count = self
+                    .rendered_content
+                    .to_lowercase()
+                    .matches(&self.find_query.to_lowercase())
+                    .count();
+                *cache = (
+                    self.rendered_content.len(),
+                    self.find_query.clone(),
+                    Some(count),
+                );
+            }
+            let n = cache.2.unwrap_or(0);
             format!("{} match{}", n, if n == 1 { "" } else { "es" })
         };
 

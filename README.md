@@ -22,15 +22,15 @@ This project is a new development iteration built upon the foundation of [GhitaB
 ### Build and Run
 
 ```powershell
-cargo build --release --locked
-cargo run --release --locked
+cargo build --release --locked --features compat-webview2
+cargo run --release --locked --features compat-webview2
 ```
 
 ### Verification and Tests
 
 ```powershell
 $env:CARGO_BUILD_JOBS = "1"
-$env:RUST_MIN_STACK = "33554432"
+$env:RUST_MIN_STACK = "67108864"
 
 cargo check --all-targets --locked
 cargo test --all-targets --locked -j 1

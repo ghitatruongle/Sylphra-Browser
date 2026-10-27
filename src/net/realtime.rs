@@ -237,7 +237,11 @@ fn websocket_transport(
             return;
         }
     };
-    set_websocket_read_timeout(socket.get_mut(), Some(Duration::from_millis(25)));
+    set_websocket_timeouts(
+        socket.get_mut(),
+        Some(Duration::from_millis(25)),
+        Some(Duration::from_secs(10)),
+    );
     let selected_protocol = response
         .headers()
         .get("Sec-WebSocket-Protocol")
@@ -318,16 +322,19 @@ fn websocket_transport(
     }
 }
 
-fn set_websocket_read_timeout(
+fn set_websocket_timeouts(
     stream: &mut tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
-    timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 ) {
     match stream {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => {
-            let _ = stream.set_read_timeout(timeout);
+            let _ = stream.set_read_timeout(read_timeout);
+            let _ = stream.set_write_timeout(write_timeout);
         }
         tungstenite::stream::MaybeTlsStream::Rustls(stream) => {
-            let _ = stream.sock.set_read_timeout(timeout);
+            let _ = stream.sock.set_read_timeout(read_timeout);
+            let _ = stream.sock.set_write_timeout(write_timeout);
         }
         _ => {}
     }
@@ -490,9 +497,12 @@ fn eventsource_transport(
     let mut last_id = String::new();
 
     loop {
-        if close_rx.try_recv().is_ok() {
-            let _ = events.try_send(EventSourceTransportEvent::Closed);
-            return;
+        match close_rx.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => {
+                let _ = events.try_send(EventSourceTransportEvent::Closed);
+                return;
+            }
+            Err(TryRecvError::Empty) => {}
         }
         let mut request = agent
             .get(&url)
@@ -534,9 +544,12 @@ fn eventsource_transport(
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut pending = String::new();
         loop {
-            if close_rx.try_recv().is_ok() {
-                let _ = events.try_send(EventSourceTransportEvent::Closed);
-                return;
+            match close_rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => {
+                    let _ = events.try_send(EventSourceTransportEvent::Closed);
+                    return;
+                }
+                Err(TryRecvError::Empty) => {}
             }
             match reader.read(&mut chunk) {
                 Ok(0) => {
@@ -607,8 +620,9 @@ fn sse_backoff_wait(close_rx: &Receiver<()>, delay_ms: u64) -> bool {
     let waited_for = Duration::from_millis(delay_ms.min(60_000));
     let deadline = std::time::Instant::now() + waited_for;
     while std::time::Instant::now() < deadline {
-        if close_rx.try_recv().is_ok() {
-            return false;
+        match close_rx.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty) => {}
         }
         std::thread::sleep(Duration::from_millis(50));
     }

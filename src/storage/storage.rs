@@ -371,6 +371,8 @@ pub struct LocalStorage {
 }
 
 const LOCAL_STORAGE_QUOTA: usize = 5 * 1024 * 1024;
+const MAX_LOCAL_STORAGE_ORIGINS: usize = 256;
+const MAX_LOCAL_STORAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 impl LocalStorage {
     pub fn new(origin: &str) -> Self {
@@ -671,10 +673,30 @@ impl StorageManager {
         mgr
     }
 
-    pub fn local_storage(&mut self, origin: &str) -> &mut LocalStorage {
+    pub fn local_storage(&mut self, origin: &str) -> Option<&mut LocalStorage> {
+        if !self.local_storage.contains_key(origin)
+            && (self.local_storage.len() >= MAX_LOCAL_STORAGE_ORIGINS
+                || self.total_local_storage_bytes() >= MAX_LOCAL_STORAGE_TOTAL_BYTES)
+        {
+            warn!(
+                "localStorage origin budget reached ({} origins, {} bytes); dropping writes for {}",
+                self.local_storage.len(),
+                self.total_local_storage_bytes(),
+                origin
+            );
+            return None;
+        }
         self.local_storage
             .entry(origin.to_string())
             .or_insert_with(|| LocalStorage::new(origin))
+            .into()
+    }
+
+    pub fn total_local_storage_bytes(&self) -> usize {
+        self.local_storage
+            .values()
+            .map(LocalStorage::total_bytes)
+            .sum()
     }
 
     pub fn get_local_storage(&self, origin: &str) -> Option<&LocalStorage> {
@@ -1152,7 +1174,7 @@ mod tests {
     fn test_storage_manager() {
         let mut mgr = StorageManager::new();
         {
-            let ls = mgr.local_storage("https://example.com");
+            let ls = mgr.local_storage("https://example.com").unwrap();
             ls.set("theme", "dark");
             ls.set("font_size", "14");
         }
@@ -1367,6 +1389,7 @@ mod tests {
             .add_cookie(Cookie::new("ephemeral", "value", "example.com", "/"));
         manager
             .local_storage("https://example.com")
+            .unwrap()
             .set("key", "value");
         manager.save();
 

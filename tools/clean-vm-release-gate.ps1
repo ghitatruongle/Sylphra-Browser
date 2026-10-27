@@ -53,7 +53,7 @@ try {
             throw "VM is not clean: an existing Sylphra installation or registry key was found."
         }
 
-        $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait -PassThru
+        $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CURRENTUSER" -Wait -PassThru
         if ($install.ExitCode -ne 0) {
             throw "Installer exited with $($install.ExitCode)."
         }

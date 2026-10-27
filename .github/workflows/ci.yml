@@ -59,6 +59,8 @@ jobs:
     needs: quality
     runs-on: windows-latest
     timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
       - name: Install pinned Rust toolchain
@@ -67,31 +69,40 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2
       - name: Resolve package version
+        id: version
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Build release
         run: cargo build --release --locked -j 1 --features compat-webview2
+      - name: Release smoke
+        shell: pwsh
+        run: ./tools/release-smoke.ps1
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            throw "ISCC.exe was not found after installing Inno Setup"
+          }
+      - name: Package release artifacts
+        shell: pwsh
+        run: ./packaging/package.ps1 -SkipBuild
       - name: Generate frozen source manifest
         shell: pwsh
         run: ./tools/make-source-manifest.ps1 -OutputPath ./source-freeze.json -ReleaseVersion $env:RELEASE_VERSION
-      - name: Stage portable files
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path portable | Out-Null
-          Copy-Item target/release/sylphra.exe portable/Sylphra.exe
-          Copy-Item target/release/sylphra-renderer-worker.exe portable/
-          Copy-Item target/release/sylphra-browser-child.exe portable/
-          $loader = Get-ChildItem -Path target/release/build -Recurse -Filter WebView2Loader.dll | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1
-          if (-not $loader) { throw "x64 WebView2Loader.dll was not produced by the compat-webview2 release build" }
-          Copy-Item $loader.FullName portable/
-          Copy-Item icon.ico,LICENSE,README.md,THIRD_PARTY_NOTICES.md portable/
       - name: Upload portable artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Sylphra-${{ env.RELEASE_VERSION }}-windows-x64
-          path: portable/
+          name: Sylphra-${{ steps.version.outputs.version }}-windows-x64
+          path: |
+            dist/Sylphra-v${{ steps.version.outputs.version }}-windows-x64.zip
+            dist/Sylphra-v${{ steps.version.outputs.version }}-windows-x64.zip.sha256
+            dist/Sylphra-v${{ steps.version.outputs.version }}-Setup.exe
+            dist/Sylphra-v${{ steps.version.outputs.version }}-Setup.exe.sha256
           if-no-files-found: error
       - name: Upload release evidence (freeze manifest)
         uses: actions/upload-artifact@v7
@@ -101,3 +112,22 @@ jobs:
             source-freeze.json
             source-freeze.json.sha256.txt
           if-no-files-found: error
+
+  evidence-verify:
+    name: Verify release evidence
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download portable artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: Sylphra-${{ needs.release.outputs.version }}-windows-x64
+      - name: Download release evidence
+        uses: actions/download-artifact@v7
+        with:
+          name: sylphra-release-evidence
+      - name: Verify artifact and manifest checksums
+        run: |
+          sha256sum -c "Sylphra-v${{ needs.release.outputs.version }}-windows-x64.zip.sha256"
+          sha256sum -c "Sylphra-v${{ needs.release.outputs.version }}-Setup.exe.sha256"
+          sha256sum -c source-freeze.json.sha256.txt

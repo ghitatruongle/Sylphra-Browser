@@ -3721,7 +3721,8 @@ impl JsvHost for RuntimeHost<'_> {
                         .filter(|value| value.is_finite() && (100.0..=599.0).contains(value))
                         .map(|value| value as u16)
                         .unwrap_or(200);
-                    self.state.cache_storage.open(&cache_name)?.put(
+                    self.state.cache_storage.put_entry(
+                        &cache_name,
                         &target,
                         "GET",
                         status,
@@ -5530,6 +5531,24 @@ impl PageRuntime {
                 &mut self.state,
             );
             self.engine.execute_with_host(code, &mut host)
+        };
+        self.flush_pending()?;
+        result
+    }
+
+    pub fn evaluate_with_step_limit(
+        &mut self,
+        code: &str,
+        max_steps: u64,
+    ) -> Result<JsvValue, String> {
+        let result = {
+            let mut host = RuntimeHost::new(
+                &mut self.live_dom,
+                &mut self.report,
+                &mut self.realm,
+                &mut self.state,
+            );
+            self.engine.eval_with_host_limit(code, &mut host, max_steps)
         };
         self.flush_pending()?;
         result

@@ -91,8 +91,8 @@ impl AudioSink for MemoryAudioSink {
 
 #[cfg(target_os = "windows")]
 pub struct WindowsWasapiSink {
-    client: windows::Win32::Media::Audio::IAudioClient,
-    render: windows::Win32::Media::Audio::IAudioRenderClient,
+    client: std::mem::ManuallyDrop<windows::Win32::Media::Audio::IAudioClient>,
+    render: std::mem::ManuallyDrop<windows::Win32::Media::Audio::IAudioRenderClient>,
     sample_rate_hz: u32,
     channels: u16,
     max_samples: usize,
@@ -195,8 +195,8 @@ impl WindowsWasapiSink {
 
         apartment_guard.disarm();
         Ok(Self {
-            client,
-            render,
+            client: std::mem::ManuallyDrop::new(client),
+            render: std::mem::ManuallyDrop::new(render),
             sample_rate_hz,
             channels,
             max_samples,
@@ -306,6 +306,8 @@ impl AudioSink for WindowsWasapiSink {
 impl Drop for WindowsWasapiSink {
     fn drop(&mut self) {
         let _ = self.pause();
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.render) };
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.client) };
         if self.com_initialized {
             unsafe { windows::Win32::System::Com::CoUninitialize() };
         }

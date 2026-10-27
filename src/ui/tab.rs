@@ -110,14 +110,34 @@ fn bounded_dom_json(dom: &Element, limit: usize) -> std::io::Result<Vec<u8>> {
     Ok(sink.bytes)
 }
 
+pub fn spill_payload_for_dom(dom: &Element) -> Result<Vec<u8>, String> {
+    let json = bounded_dom_json(dom, resource_caps::SNAPSHOT_JSON_RAM_BYTES)
+        .map_err(|error| error.to_string())?;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&json)
+        .map_err(|error| error.to_string())?;
+    encoder.finish().map_err(|error| error.to_string())
+}
+
 fn decompress_dom_bytes(data: &[u8]) -> Result<Element, Box<dyn std::error::Error>> {
     const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+    use std::io::Read as _;
 
     let json = if data.starts_with(GZIP_MAGIC) {
-        let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(data));
-        std::io::read_to_string(&mut decoder)
-            .map_err(|e| format!("Failed to decompress DOM data: {}", e))?
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(std::io::Cursor::new(data))
+            .take(resource_caps::SNAPSHOT_JSON_RAM_BYTES as u64 + 1)
+            .read_to_string(&mut decoded)
+            .map_err(|e| format!("Failed to decompress DOM data: {}", e))?;
+        if decoded.len() > resource_caps::SNAPSHOT_JSON_RAM_BYTES {
+            return Err("DOM snapshot exceeds the restore budget".into());
+        }
+        decoded
     } else {
+        if data.len() > resource_caps::SNAPSHOT_JSON_RAM_BYTES {
+            return Err("DOM snapshot exceeds the restore budget".into());
+        }
         String::from_utf8(data.to_vec()).map_err(|e| format!("Failed to read DOM JSON: {}", e))?
     };
 
@@ -137,6 +157,21 @@ fn decompress_dom_bytes(data: &[u8]) -> Result<Element, Box<dyn std::error::Erro
 }
 
 const SNAPSHOT_MAX_JSON_DEPTH: usize = 1024;
+
+#[cfg(test)]
+mod snapshot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_restore_rejects_decompression_bombs() {
+        let expanded = vec![0u8; resource_caps::SNAPSHOT_JSON_RAM_BYTES + 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &expanded).unwrap();
+        let bomb = encoder.finish().unwrap();
+        assert!(bomb.len() < resource_caps::SNAPSHOT_JSON_RAM_BYTES);
+        assert!(decompress_dom_bytes(&bomb).is_err());
+    }
+}
 
 fn json_nesting_depth(json: &str) -> usize {
     let mut depth = 0usize;
@@ -430,6 +465,20 @@ impl Tab {
         Ok(result)
     }
 
+    pub fn evaluate_js_with_step_limit(
+        &mut self,
+        script: &str,
+        max_steps: u64,
+    ) -> Result<crate::javascript::JsvValue, String> {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Err("No active runtime on tab".to_string());
+        };
+        let result = runtime.evaluate_with_step_limit(script, max_steps)?;
+        let dom = runtime.dom_element();
+        self.set_dom(dom);
+        Ok(result)
+    }
+
     pub fn dispatch_event(
         &mut self,
         target: u64,
@@ -626,23 +675,25 @@ impl Tab {
         if self.is_disk_backed {
             return Ok(0);
         }
-        let released = self
-            .estimated_live_bytes()
-            .saturating_add(self.compressed_snapshot_bytes());
-        let json = bounded_dom_json(&self.dom, resource_caps::SNAPSHOT_JSON_RAM_BYTES)
-            .map_err(|error| error.to_string())?;
-
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder
-            .write_all(&json)
-            .map_err(|error| error.to_string())?;
-        let payload = encoder.finish().map_err(|error| error.to_string())?;
-
+        let payload = self.spill_payload()?;
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
         let path = directory.join(self.snapshot_file_name());
         crate::fs_atomic::atomic_write_bytes(&path, &payload).map_err(|error| error.to_string())?;
+        Ok(self.commit_disk_spill_state(path.to_string_lossy().into_owned()))
+    }
 
-        self.snapshot_path = Some(path.to_string_lossy().into_owned());
+    pub fn spill_payload(&self) -> Result<Vec<u8>, String> {
+        spill_payload_for_dom(&self.dom)
+    }
+
+    pub fn commit_disk_spill_state(&mut self, path: String) -> usize {
+        if self.is_disk_backed {
+            return 0;
+        }
+        let released = self
+            .estimated_live_bytes()
+            .saturating_add(self.compressed_snapshot_bytes());
+        self.snapshot_path = Some(path);
         self.is_disk_backed = true;
         self.compressed_dom = None;
         self.set_dom(Element::new("root"));
@@ -650,16 +701,39 @@ impl Tab {
         self.runtime = None;
         self.is_sleeping = true;
         self.slept_at = Some(chrono::Utc::now().timestamp());
-        Ok(released)
+        released
+    }
+
+    pub fn commit_ram_sleep_state(&mut self, payload: Vec<u8>) -> usize {
+        if self.is_sleeping {
+            return 0;
+        }
+        let original = self.estimated_live_bytes();
+        self.compressed_dom = Some(payload);
+        let freed = original.saturating_sub(self.compressed_snapshot_bytes());
+        self.set_dom(Element::new("root"));
+        self.set_layout(None);
+        self.runtime = None;
+        self.is_sleeping = true;
+        self.slept_at = Some(chrono::Utc::now().timestamp());
+        freed
     }
 
     pub fn restore_from_disk(&mut self) -> bool {
         let Some(path) = self.snapshot_path.clone() else {
             return false;
         };
-        let restored = std::fs::read(&path)
-            .ok()
-            .and_then(|data| decompress_dom_bytes(&data).ok());
+        let max_file_bytes = (resource_caps::SNAPSHOT_JSON_RAM_BYTES as u64).saturating_mul(2);
+        let within_budget = std::fs::metadata(&path)
+            .map(|metadata| metadata.len() <= max_file_bytes)
+            .unwrap_or(false);
+        let restored = if within_budget {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|data| decompress_dom_bytes(&data).ok())
+        } else {
+            None
+        };
         match restored {
             Some(dom) => {
                 self.set_dom(dom);
@@ -907,6 +981,10 @@ impl TabManager {
 
     pub fn get_tab_by_index(&self, index: usize) -> Option<&Tab> {
         self.tab_order.get(index).and_then(|id| self.tabs.get(id))
+    }
+
+    pub fn index_of(&self, id: usize) -> Option<usize> {
+        self.tab_order.iter().position(|candidate| *candidate == id)
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {

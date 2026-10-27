@@ -207,7 +207,17 @@ fn instance_of_and_in_operators_work_on_objects_and_arrays() {
 
 #[test]
 fn bounded_failures_still_error_instead_of_hanging() {
-    assert!(eval_err("while(true){}").contains("Infinite loop"));
+    let bounded = eval_err("while(true){}");
+    assert!(
+        bounded.contains("Infinite loop") || bounded.contains("step budget"),
+        "got: {bounded}"
+    );
 
     assert!(eval_err("undefined.name").contains("TypeError"));
+}
+
+#[test]
+fn finite_loops_charge_fuel_instead_of_hitting_an_iteration_cap() {
+    let value = eval("let i=0;while(i<50000){i=i+1};i");
+    assert_eq!(num(value), 50000.0);
 }

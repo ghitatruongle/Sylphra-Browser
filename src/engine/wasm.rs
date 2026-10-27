@@ -107,11 +107,18 @@ pub struct LocalDecl {
     pub value_type: ValueType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockTargets {
+    pub else_pc: Option<usize>,
+    pub end_pc: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionBody {
     pub locals: Vec<LocalDecl>,
 
-    pub code: Vec<u8>,
+    pub code: std::sync::Arc<Vec<u8>>,
+    pub block_targets: std::collections::HashMap<usize, BlockTargets>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -530,14 +537,15 @@ fn parse_code_section(cursor: &mut Cursor, module: &mut WasmModule) -> Result<()
             locals.push(LocalDecl { count, value_type });
         }
         let code_start = body.pos;
-        let depth = validate_code(&body.bytes[body.pos..])?;
-        if depth > MAX_CODE_DEPTH {
+        let validated = validate_code(&body.bytes[body.pos..])?;
+        if validated.max_depth > MAX_CODE_DEPTH {
             return Err("Code nesting depth exceeded".to_string());
         }
         body.pos = body.bytes.len();
         module.bodies.push(FunctionBody {
             locals,
-            code: body.bytes[code_start..].to_vec(),
+            code: std::sync::Arc::new(body.bytes[code_start..].to_vec()),
+            block_targets: validated.block_targets,
         });
     }
     Ok(())
@@ -613,26 +621,46 @@ fn skip_immediate(cursor: &mut Cursor, opcode: u8) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_code(code: &[u8]) -> Result<usize, String> {
+pub(crate) struct ValidatedBody {
+    pub max_depth: usize,
+    pub block_targets: std::collections::HashMap<usize, BlockTargets>,
+}
+
+fn validate_code(code: &[u8]) -> Result<ValidatedBody, String> {
     let mut cursor = Cursor::new(code);
-    let mut depth = 0usize;
     let mut max_depth = 0usize;
+    let mut open: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut block_targets: std::collections::HashMap<usize, BlockTargets> =
+        std::collections::HashMap::new();
     loop {
         if cursor.is_empty() {
             return Err("Function body missing end opcode".to_string());
         }
+        let opcode_pc = cursor.pos;
         let opcode = cursor.read_u8()?;
         match opcode {
-            0x0B => {
-                if depth == 0 {
-                    return Ok(max_depth);
+            0x0B => match open.pop() {
+                Some((block_pc, else_pc)) => {
+                    let targets = BlockTargets {
+                        else_pc: else_pc.map(|pc| pc + 1),
+                        end_pc: opcode_pc,
+                    };
+                    block_targets.insert(block_pc, targets);
+                    if let Some(else_pc) = else_pc {
+                        block_targets.insert(else_pc, targets);
+                    }
                 }
-                depth -= 1;
-            }
-            0x02 | 0x03 => {
-                depth += 1;
-                max_depth = max_depth.max(depth);
-
+                None => {
+                    return Ok(ValidatedBody {
+                        max_depth,
+                        block_targets,
+                    })
+                }
+            },
+            0x02..=0x04 => {
+                if open.len() >= MAX_CODE_DEPTH {
+                    return Err("Code nesting depth exceeded".to_string());
+                }
                 let block_type = cursor.peek_u8()?;
                 match block_type {
                     0x40 => {
@@ -642,28 +670,32 @@ fn validate_code(code: &[u8]) -> Result<usize, String> {
                         cursor.read_u8()?;
                     }
                     _ => {
-                        cursor.read_leb_u32()?;
+                        let mut terminated = false;
+                        for _ in 0..5 {
+                            let byte = cursor.read_u8()?;
+                            if byte & 0x80 == 0 {
+                                terminated = true;
+                                break;
+                            }
+                        }
+                        if !terminated {
+                            return Err("Block type immediate is too long".to_string());
+                        }
                     }
                 }
+                open.push((opcode_pc, None));
+                max_depth = max_depth.max(open.len());
             }
-            0x04 => {
-                depth += 1;
-                max_depth = max_depth.max(depth);
-                let block_type = cursor.peek_u8()?;
-                match block_type {
-                    0x40 => {
-                        cursor.read_u8()?;
-                    }
-                    0x7C..=0x7F => {
-                        cursor.read_u8()?;
-                    }
-                    _ => {
-                        cursor.read_leb_u32()?;
-                    }
+            0x05 => {
+                let top = open
+                    .last_mut()
+                    .ok_or_else(|| "else without a matching block".to_string())?;
+                if top.1.is_some() {
+                    return Err("multiple else clauses for one block".to_string());
                 }
+                top.1 = Some(opcode_pc);
             }
             0x00 | 0x01 => {}
-            0x05 => {}
             0x0F => {}
             0x1A | 0x1B => {}
             0x1C => {

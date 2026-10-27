@@ -641,20 +641,12 @@ fn signed_executable_signer(path: &Path) -> Result<SignerIdentity, String> {
     use windows::Win32::Security::Cryptography::{
         CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext,
         CertGetCertificateContextProperty, CertGetNameStringW, CryptMsgClose, CryptMsgGetParam,
-        CryptQueryObject, CERT_CONTEXT, CERT_FIND_FLAGS, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+        CryptQueryObject, CERT_CONTEXT, CERT_FIND_CERT_ID, CERT_ID, CERT_ID_0,
+        CERT_ID_ISSUER_SERIAL_NUMBER, CERT_ISSUER_SERIAL_NUMBER, CERT_NAME_SIMPLE_DISPLAY_TYPE,
         CERT_QUERY_CONTENT_FLAG_ALL, CERT_QUERY_CONTENT_TYPE, CERT_QUERY_ENCODING_TYPE,
         CERT_QUERY_FORMAT_FLAG_ALL, CERT_QUERY_FORMAT_TYPE, CERT_QUERY_OBJECT_FILE,
-        CERT_SHA256_HASH_PROP_ID, CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM, CRYPT_INTEGER_BLOB,
-        HCERTSTORE,
+        CERT_SHA256_HASH_PROP_ID, CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM, HCERTSTORE,
     };
-
-    const CERT_FIND_ISSUER_SERIAL_NUMBER: CERT_FIND_FLAGS = CERT_FIND_FLAGS(0x0004_0004);
-
-    #[repr(C)]
-    struct CertFindIssuerSerial {
-        issuer: CRYPT_INTEGER_BLOB,
-        serial_number: CRYPT_INTEGER_BLOB,
-    }
 
     struct SignatureHandles {
         store: HCERTSTORE,
@@ -730,17 +722,22 @@ fn signed_executable_signer(path: &Path) -> Result<SignerIdentity, String> {
 
     let signer: CMSG_SIGNER_INFO =
         unsafe { std::ptr::read_unaligned(signer_bytes.as_ptr().cast::<CMSG_SIGNER_INFO>()) };
-    let find = CertFindIssuerSerial {
-        issuer: signer.Issuer,
-        serial_number: signer.SerialNumber,
+    let find = CERT_ID {
+        dwIdChoice: CERT_ID_ISSUER_SERIAL_NUMBER,
+        Anonymous: CERT_ID_0 {
+            IssuerSerialNumber: CERT_ISSUER_SERIAL_NUMBER {
+                Issuer: signer.Issuer,
+                SerialNumber: signer.SerialNumber,
+            },
+        },
     };
     let cert = unsafe {
         CertFindCertificateInStore(
             store,
             encoding,
             0,
-            CERT_FIND_ISSUER_SERIAL_NUMBER,
-            Some((&find as *const CertFindIssuerSerial).cast()),
+            CERT_FIND_CERT_ID,
+            Some((&find as *const CERT_ID).cast()),
             None,
         )
     };

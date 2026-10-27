@@ -8,6 +8,8 @@ use sylphra::media_core::{DecodedAudioFrame, DecodedVideoFrame};
 use sylphra::media_runtime::{MediaRuntimeLimits, PageMediaRuntime};
 use sylphra::pdf;
 use sylphra::runtime_core::{RuntimeLimits, RuntimeRealm};
+use sylphra::wasm::parse_module;
+use sylphra::wasm_interp::{WasmInstance, WasmValue};
 
 fn deterministic_bytes(seed: &mut u64, length: usize) -> Vec<u8> {
     (0..length)
@@ -50,6 +52,10 @@ fn deterministic_parser_corpus_never_panics_or_escapes_budgets() {
             let _ = parse_media_segment(&bytes, &[]);
             let _ = pdf::parse(&bytes, "fuzz.pdf");
             let _ = parse_css(&text);
+            let _ = parse_module(&bytes).and_then(|module| {
+                let mut instance = WasmInstance::instantiate(module)?;
+                instance.invoke(0, &[WasmValue::I32(1)])
+            });
             let prepared = prepare_document(&text, "fuzz", &[], 1_280, 720);
             assert!(prepared.stats.dom_nodes <= 250_000);
             assert!(prepared.stats.layout_nodes <= 250_000);

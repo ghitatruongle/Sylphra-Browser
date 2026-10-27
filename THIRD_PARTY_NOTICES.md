@@ -30,6 +30,8 @@ licensed dependencies; this notice does not change their licenses.
 | ureq | 2.12.1 | MIT OR Apache-2.0 |
 | url | 2.5.8 | MIT OR Apache-2.0 |
 | windows | 0.52.0 | MIT OR Apache-2.0 |
+| windows (WebView2 bindings) | 0.58.0 | MIT OR Apache-2.0 |
+| webview2-com (Windows) | 0.33.0 | MIT OR Apache-2.0 |
 | winres | 0.1.12 | MIT |
 | bytemuck (Windows) | 1.25.2 | Zlib OR Apache-2.0 OR MIT |
 | pollster (Windows) | 1.0.1 | Apache-2.0 OR MIT |

@@ -340,6 +340,13 @@ impl MediaSource {
         }
     }
 
+    pub fn queued_bytes(&self) -> usize {
+        self.source_buffers
+            .iter()
+            .map(SourceBuffer::queued_bytes)
+            .sum()
+    }
+
     pub fn open(&mut self) -> Result<(), String> {
         if self.ready_state != MediaSourceReadyState::Closed {
             return Err("MediaSource is already open".to_string());

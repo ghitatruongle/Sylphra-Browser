@@ -6,7 +6,7 @@ use crate::parser::{self, Element};
 use crate::text_renderer::TextRenderer;
 use crate::RenderStats;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreparedDocument {
     pub dom: Element,
     pub title: String,

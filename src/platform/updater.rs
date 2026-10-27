@@ -652,7 +652,15 @@ impl UpdateManager {
             self.persist_state()?;
             return Err(error);
         }
-        verify_tree_files(&install_dir, &package.manifest.file_hashes)?;
+        if let Err(error) = verify_tree_files(&install_dir, &package.manifest.file_hashes) {
+            let rollback = UpdateInstaller::restore_backup(&backup, &install_dir);
+            self.state = match rollback {
+                Ok(()) => UpdateState::RolledBack,
+                Err(ref rollback_error) => UpdateState::Failed(rollback_error.to_string()),
+            };
+            self.persist_state()?;
+            return Err(error);
+        }
         self.update_journal_phase(JournalPhase::Committed)?;
         self.current_version = target_version.clone();
         self.installed_manifest = Some(package.manifest);

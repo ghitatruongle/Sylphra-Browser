@@ -83,6 +83,9 @@ const MAX_CALL_DEPTH: u64 = 8;
 #[cfg(not(debug_assertions))]
 const MAX_CALL_DEPTH: u64 = 32;
 
+#[cfg(debug_assertions)]
+const MAX_PARSE_DEPTH: usize = 128;
+#[cfg(not(debug_assertions))]
 const MAX_PARSE_DEPTH: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,7 +129,7 @@ pub(crate) struct EvalCtx<'host> {
     host: &'host mut dyn JsvHost,
     microtasks: VecDeque<PromiseReactionJob>,
     microtasks_queued: usize,
-    pending_promise_reactions: HashMap<usize, Vec<PendingPromiseReaction>>,
+    pending_promise_reactions: HashMap<usize, (JsvPromiseRef, Vec<PendingPromiseReaction>)>,
 
     modules: Option<&'host mut JsvModuleGraph>,
 
@@ -1357,6 +1360,13 @@ fn set_index(set: &JsvSet, value: &JsvValue) -> Option<usize> {
         .position(|existing| same_value_zero(existing, value))
 }
 
+fn charge_scan_steps(ctx: &mut EvalCtx<'_>, entries: usize) -> Result<(), String> {
+    for _ in 0..(entries / 256) {
+        ctx.step()?;
+    }
+    Ok(())
+}
+
 fn weak_key_of(value: &JsvValue) -> Option<JsvWeakKey> {
     match value {
         JsvValue::Object(object) => Some(JsvWeakKey::Object(Rc::downgrade(object))),
@@ -2139,7 +2149,7 @@ impl JsvEngine {
         self.eval_with_host_limit(code, host, MAX_EVAL_STEPS)
     }
 
-    fn eval_with_host_limit(
+    pub fn eval_with_host_limit(
         &mut self,
         code: &str,
         host: &mut dyn JsvHost,
@@ -6216,9 +6226,7 @@ fn while_loop_step(
             value => result = value,
         }
         iterations += 1;
-        if iterations > 10_000 {
-            return Err("Infinite loop detected (exceeded 10,000 iterations)".to_string());
-        }
+        ctx.step()?;
         let c = eval_expr(cond, &mut e, console, ctx)?;
         if let JsvValue::YieldSignal(signal) = c {
             return Ok(JsvValue::YieldSignal(Box::new(signal.push(
@@ -6281,9 +6289,6 @@ fn do_while_loop_step(
             return Ok(result);
         }
         iterations = iterations.saturating_add(1);
-        if iterations > 10_000 {
-            return Err("Infinite loop detected (exceeded 10,000 iterations)".to_string());
-        }
         ctx.step()?;
     }
 }
@@ -6759,9 +6764,7 @@ fn resume_cont(
         } => {
             let mut e = cont_env;
             let iterations = iterations + 1;
-            if iterations > 10_000 {
-                return Err("Infinite loop detected (exceeded 10,000 iterations)".to_string());
-            }
+            ctx.step()?;
             let cond_value = eval_expr(&cond, &mut e, console, ctx)?;
             if let JsvValue::YieldSignal(signal) = cond_value {
                 return Ok(JsvValue::YieldSignal(Box::new(signal.push(
@@ -6808,9 +6811,7 @@ fn resume_cont(
                 return Ok(result);
             }
             let iterations = iterations.saturating_add(1);
-            if iterations > 10_000 {
-                return Err("Infinite loop detected (exceeded 10,000 iterations)".to_string());
-            }
+            ctx.step()?;
             do_while_loop_step(&cond, &body, e, result, iterations, console, ctx)
         }
         Cont::DoWhileCond {
@@ -6824,9 +6825,7 @@ fn resume_cont(
                 return Ok(result);
             }
             let iterations = iterations.saturating_add(1);
-            if iterations > 10_000 {
-                return Err("Infinite loop detected (exceeded 10,000 iterations)".to_string());
-            }
+            ctx.step()?;
             do_while_loop_step(&cond, &body, cont_env, result, iterations, console, ctx)
         }
         Cont::ForInRest {
@@ -7325,14 +7324,15 @@ fn register_pending_reaction(
     let pending = ctx
         .pending_promise_reactions
         .values()
-        .map(Vec::len)
+        .map(|(_, reactions)| reactions.len())
         .sum::<usize>();
     if pending >= MAX_PROMISE_JOBS {
         return Err("Promise pending-reaction budget exceeded".to_string());
     }
     ctx.pending_promise_reactions
         .entry(promise_key(promise))
-        .or_default()
+        .or_insert_with(|| (promise.clone(), Vec::new()))
+        .1
         .push(reaction);
     Ok(())
 }
@@ -7377,7 +7377,7 @@ fn settle_promise(
     if matches!(state, JsvPromiseState::Pending) {
         return Ok(());
     }
-    if let Some(reactions) = ctx.pending_promise_reactions.remove(&promise_key(promise)) {
+    if let Some((_, reactions)) = ctx.pending_promise_reactions.remove(&promise_key(promise)) {
         for reaction in reactions {
             enqueue_registered_reaction(ctx, reaction, state.clone())?;
         }
@@ -7472,6 +7472,12 @@ fn call_string_method(
     };
     let chars: Vec<char> = text.chars().collect();
     let count = chars.len();
+    let byte_at_char = |index: usize| -> usize {
+        text.char_indices()
+            .nth(index)
+            .map(|(byte, _)| byte)
+            .unwrap_or(text.len())
+    };
     let mut bounded = |value: String| -> Result<JsvValue, String> {
         check_string_alloc(ctx, value.len())?;
         Ok(JsvValue::String(value))
@@ -7522,17 +7528,14 @@ fn call_string_method(
             let start = number_arg(1).unwrap_or(0.0).max(0.0) as usize;
             let position = if needle.is_empty() {
                 start.min(count)
+            } else if start >= count {
+                usize::MAX
             } else {
-                let mut found = None;
-                for index in start..count {
-                    let candidate: String =
-                        chars[index..].iter().take(needle.chars().count()).collect();
-                    if candidate == needle {
-                        found = Some(index);
-                        break;
-                    }
+                let from = byte_at_char(start);
+                match text[from..].find(&needle) {
+                    Some(offset) => start + text[from..from + offset].chars().count(),
+                    None => usize::MAX,
                 }
-                found.unwrap_or(usize::MAX)
             };
             Ok(JsvValue::Number(if position == usize::MAX {
                 -1.0
@@ -7545,12 +7548,11 @@ fn call_string_method(
             let start = (number_arg(1).unwrap_or(0.0).max(0.0) as usize).min(count);
             let found = if needle.is_empty() {
                 true
+            } else if start >= count {
+                false
             } else {
-                (start..count).any(|index| {
-                    let candidate: String =
-                        chars[index..].iter().take(needle.chars().count()).collect();
-                    candidate == needle
-                })
+                let from = byte_at_char(start);
+                text[from..].contains(&needle)
             };
             Ok(JsvValue::Boolean(found))
         }
@@ -7605,30 +7607,19 @@ fn call_string_method(
             let pattern = string_arg(0)?;
             let replacement = string_arg(1)?;
             if pattern.is_empty() {
-                return bounded(format!(
-                    "{}{}",
-                    replacement,
-                    chars.iter().collect::<String>()
-                ));
+                return bounded(format!("{}{}", replacement, text));
             }
-            let pattern_chars: Vec<char> = pattern.chars().collect();
-            let mut replaced = false;
-            let mut output = String::new();
-            let mut index = 0;
-            while index < count {
-                if !replaced && index + pattern_chars.len() <= count {
-                    let candidate: String =
-                        chars[index..index + pattern_chars.len()].iter().collect();
-                    if candidate == pattern {
-                        output.push_str(&replacement);
-                        index += pattern_chars.len();
-                        replaced = true;
-                        continue;
-                    }
+            let output = match text.find(&pattern) {
+                Some(byte) => {
+                    let mut output =
+                        String::with_capacity(text.len().saturating_add(replacement.len()));
+                    output.push_str(&text[..byte]);
+                    output.push_str(&replacement);
+                    output.push_str(&text[byte + pattern.len()..]);
+                    output
                 }
-                output.push(chars[index]);
-                index += 1;
-            }
+                None => text,
+            };
             bounded(output)
         }
         "split" => {
@@ -7645,27 +7636,18 @@ fn call_string_method(
                         .collect::<Vec<_>>()
                 }
                 Some(separator) => {
-                    let separator_chars: Vec<char> = separator.chars().collect();
                     let mut parts = Vec::new();
                     let mut current = String::new();
-                    let mut index = 0;
-                    while index < count {
-                        if index + separator_chars.len() <= count {
-                            let candidate: String =
-                                chars[index..index + separator_chars.len()].iter().collect();
-                            if candidate == separator {
-                                parts.push(JsvValue::String(std::mem::take(&mut current)));
-
-                                if parts.len() > 100_000 {
-                                    return Err("Split result budget exceeded".to_string());
-                                }
-                                index += separator_chars.len();
-                                continue;
-                            }
+                    let mut consumed = 0usize;
+                    for (byte, _) in text.match_indices(separator) {
+                        current.push_str(&text[consumed..byte]);
+                        consumed = byte + separator.len();
+                        parts.push(JsvValue::String(std::mem::take(&mut current)));
+                        if parts.len() > 100_000 {
+                            return Err("Split result budget exceeded".to_string());
                         }
-                        current.push(chars[index]);
-                        index += 1;
                     }
+                    current.push_str(&text[consumed..]);
                     parts.push(JsvValue::String(current));
                     if parts.len() > 100_000 {
                         return Err("Split result budget exceeded".to_string());
@@ -7722,44 +7704,19 @@ fn call_string_method(
             let pattern = string_arg(0)?;
             let replacement = string_arg(1)?;
             if pattern.is_empty() {
-                return bounded(format!(
-                    "{}{}",
-                    replacement,
-                    chars.iter().collect::<String>()
-                ));
+                return bounded(format!("{}{}", replacement, text));
             }
-            let pattern_chars: Vec<char> = pattern.chars().collect();
-            let mut output = String::new();
-            let mut index = 0;
-            while index < count {
-                if index + pattern_chars.len() <= count {
-                    let candidate: String =
-                        chars[index..index + pattern_chars.len()].iter().collect();
-                    if candidate == pattern {
-                        output.push_str(&replacement);
-                        index += pattern_chars.len();
-                        continue;
-                    }
-                }
-                output.push(chars[index]);
-                index += 1;
-            }
-            bounded(output)
+            let replaced = text.replace(&pattern, &replacement);
+            bounded(replaced)
         }
         "matchAll" => {
             let pattern = string_arg(0)?;
-            let pattern_chars: Vec<char> = pattern.chars().collect();
-            let plen = pattern_chars.len();
             let mut results = Vec::new();
             if !pattern.is_empty() {
-                let mut index = 0;
-                while index + plen <= count {
-                    let candidate: String = chars[index..index + plen].iter().collect();
-                    if candidate == pattern {
-                        results.push(JsvValue::String(candidate));
-                        index += plen;
-                    } else {
-                        index += 1;
+                for (_, matched) in text.match_indices(pattern.as_str()) {
+                    results.push(JsvValue::String(matched.to_string()));
+                    if results.len() > 100_000 {
+                        return Err("Match result budget exceeded".to_string());
                     }
                 }
             }
@@ -7844,6 +7801,7 @@ fn call_bound_native(
         ("Map.get", JsvValue::Map(map)) => {
             let key = args.first().cloned().unwrap_or(JsvValue::Undefined);
             let borrowed = map.borrow();
+            charge_scan_steps(ctx, borrowed.entries.len())?;
             Ok(map_index(&borrowed, &key)
                 .map(|index| borrowed.entries[index].1.clone())
                 .unwrap_or(JsvValue::Undefined))
@@ -7853,6 +7811,7 @@ fn call_bound_native(
             let value = args.get(1).cloned().unwrap_or(JsvValue::Undefined);
             {
                 let mut borrowed = map.borrow_mut();
+                charge_scan_steps(ctx, borrowed.entries.len())?;
                 if let Some(index) = map_index(&borrowed, &key) {
                     borrowed.entries[index].1 = value;
                 } else {
@@ -7866,11 +7825,16 @@ fn call_bound_native(
         }
         ("Map.has", JsvValue::Map(map)) => {
             let key = args.first().cloned().unwrap_or(JsvValue::Undefined);
-            Ok(JsvValue::Boolean(map_index(&map.borrow(), &key).is_some()))
+            let borrowed = map.borrow();
+            charge_scan_steps(ctx, borrowed.entries.len())?;
+            Ok(JsvValue::Boolean(map_index(&borrowed, &key).is_some()))
         }
         ("Map.delete", JsvValue::Map(map)) => {
             let key = args.first().cloned().unwrap_or(JsvValue::Undefined);
-            let index = map_index(&map.borrow(), &key);
+            let borrowed = map.borrow();
+            charge_scan_steps(ctx, borrowed.entries.len())?;
+            let index = map_index(&borrowed, &key);
+            drop(borrowed);
             Ok(JsvValue::Boolean(index.is_some_and(|index| {
                 map.borrow_mut().entries.remove(index);
                 true
@@ -7918,6 +7882,7 @@ fn call_bound_native(
             let value = args.first().cloned().unwrap_or(JsvValue::Undefined);
             {
                 let mut borrowed = set.borrow_mut();
+                charge_scan_steps(ctx, borrowed.values.len())?;
                 if set_index(&borrowed, &value).is_none() {
                     if borrowed.values.len() >= MAX_COLLECTION_ENTRIES {
                         return Err("RangeError: Set entry budget exceeded".to_string());
@@ -7929,13 +7894,16 @@ fn call_bound_native(
         }
         ("Set.has", JsvValue::Set(set)) => {
             let value = args.first().cloned().unwrap_or(JsvValue::Undefined);
-            Ok(JsvValue::Boolean(
-                set_index(&set.borrow(), &value).is_some(),
-            ))
+            let borrowed = set.borrow();
+            charge_scan_steps(ctx, borrowed.values.len())?;
+            Ok(JsvValue::Boolean(set_index(&borrowed, &value).is_some()))
         }
         ("Set.delete", JsvValue::Set(set)) => {
             let value = args.first().cloned().unwrap_or(JsvValue::Undefined);
-            let index = set_index(&set.borrow(), &value);
+            let borrowed = set.borrow();
+            charge_scan_steps(ctx, borrowed.values.len())?;
+            let index = set_index(&borrowed, &value);
+            drop(borrowed);
             Ok(JsvValue::Boolean(index.is_some_and(|index| {
                 set.borrow_mut().values.remove(index);
                 true
@@ -7986,6 +7954,7 @@ fn call_bound_native(
             };
             let mut borrowed = map.borrow_mut();
             borrowed.entries.retain(|entry| weak_key_alive(&entry.key));
+            charge_scan_steps(ctx, borrowed.entries.len())?;
             let index = borrowed
                 .entries
                 .iter()
@@ -8024,6 +7993,7 @@ fn call_bound_native(
                 .ok_or_else(|| "TypeError: WeakSet value must be an object".to_string())?;
             let mut borrowed = set.borrow_mut();
             borrowed.keys.retain(weak_key_alive);
+            charge_scan_steps(ctx, borrowed.keys.len())?;
             let index = borrowed
                 .keys
                 .iter()

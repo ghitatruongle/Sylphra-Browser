@@ -30,15 +30,12 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
 }
 
-$included = @()
-Get-ChildItem -Path $root -Recurse -File -Force | ForEach-Object {
-    $relative = $_.FullName.Substring($root.Length + 1).Replace("\", "/")
-    $top = $relative.Split("/")[0]
-    if ($excludedTopLevel -contains $top -or $excludedFiles -contains $relative) {
-        return
-    }
-    $included += $relative
+$trackedRaw = git -C $root ls-files -z
+if ($LASTEXITCODE -ne 0) {
+    throw "git ls-files failed; the manifest requires a git worktree"
 }
+$included = @($trackedRaw -split "`0" | Where-Object { $_.Length -gt 0 } | ForEach-Object { $_.Replace("\", "/") } |
+    Where-Object { $excludedFiles -notcontains $_ })
 $included = $included | Sort-Object
 
 $fileMap = [ordered]@{}

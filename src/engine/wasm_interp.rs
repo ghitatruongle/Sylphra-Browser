@@ -312,8 +312,7 @@ impl WasmInstance {
             .module
             .bodies
             .get(defined)
-            .ok_or_else(|| "Function has no body (import)".to_string())?
-            .clone();
+            .ok_or_else(|| "Function has no body (import)".to_string())?;
         let mut locals = args.to_vec();
         for decl in &body.locals {
             for _ in 0..decl.count {
@@ -586,6 +585,7 @@ impl WasmInstance {
             .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
         match opcode {
             0x02..=0x04 => {
+                let block_opcode_pc = frame.pc.saturating_sub(1);
                 let block_type = *code
                     .get(frame.pc)
                     .ok_or_else(|| "Missing block type".to_string())?;
@@ -593,16 +593,21 @@ impl WasmInstance {
                 if !matches!(block_type, 0x40 | 0x7F | 0x7E | 0x7D | 0x7C) {
                     let mut tmp = 0u32;
                     let mut shift = 0u32;
-                    loop {
+                    let mut terminated = false;
+                    for _ in 0..5 {
                         let byte = *code
                             .get(frame.pc)
                             .ok_or_else(|| "Block type index out of range".to_string())?;
                         frame.pc += 1;
                         tmp |= u32::from(byte & 0x7F) << shift;
                         if byte & 0x80 == 0 {
+                            terminated = true;
                             break;
                         }
                         shift += 7;
+                    }
+                    if !terminated {
+                        return Err("Block type immediate is too long".to_string());
                     }
                     let _ = tmp;
                 }
@@ -623,6 +628,17 @@ impl WasmInstance {
                         types[type_index].results.len().min(1)
                     }
                 };
+                let defined = self
+                    .defined_body_index(frame.function_index)
+                    .ok_or_else(|| "Function has no body (import)".to_string())?;
+                let targets = *self
+                    .module
+                    .bodies
+                    .get(defined)
+                    .ok_or_else(|| "Function has no body (import)".to_string())?
+                    .block_targets
+                    .get(&block_opcode_pc)
+                    .ok_or_else(|| "Block target table is missing an entry".to_string())?;
                 if kind == ControlKind::If {
                     let cond = frame
                         .stack
@@ -632,13 +648,16 @@ impl WasmInstance {
                         return Err("if condition must be i32".to_string());
                     };
                     if condition == 0 {
-                        let else_pc = find_else_or_end(code, frame.pc)?;
-                        let end_pc = find_end(code, frame.pc)?;
-                        frame.pc = if else_pc < end_pc { else_pc } else { end_pc };
+                        let else_entry = targets.else_pc.unwrap_or(targets.end_pc + 1);
+                        frame.pc = if else_entry < targets.end_pc {
+                            else_entry
+                        } else {
+                            targets.end_pc
+                        };
                         frame.controls.push(ControlFrame {
                             kind,
-                            else_pc,
-                            end_pc,
+                            else_pc: else_entry,
+                            end_pc: targets.end_pc,
                             stack_height: frame.stack.len(),
                             result_count,
                         });
@@ -646,18 +665,29 @@ impl WasmInstance {
                     }
                 }
 
-                let end_pc = find_end(code, frame.pc)?;
                 frame.controls.push(ControlFrame {
                     kind,
                     else_pc: frame.pc,
-                    end_pc,
+                    end_pc: targets.end_pc,
                     stack_height: frame.stack.len(),
                     result_count,
                 });
                 Ok(Action::Continue)
             }
             0x05 => {
-                let end_pc = find_end(code, frame.pc)?;
+                let block_opcode_pc = frame.pc.saturating_sub(1);
+                let defined = self
+                    .defined_body_index(frame.function_index)
+                    .ok_or_else(|| "Function has no body (import)".to_string())?;
+                let end_pc = self
+                    .module
+                    .bodies
+                    .get(defined)
+                    .ok_or_else(|| "Function has no body (import)".to_string())?
+                    .block_targets
+                    .get(&block_opcode_pc)
+                    .ok_or_else(|| "Block target table is missing an entry".to_string())?
+                    .end_pc;
                 frame.pc = end_pc;
                 Ok(Action::Continue)
             }
@@ -1741,118 +1771,6 @@ fn trunc_f64_to_u64(value: f64) -> Result<u64, String> {
     Ok(truncated as u64)
 }
 
-fn skip_immediates(code: &[u8], pc: usize) -> Result<usize, String> {
-    let opcode = *code
-        .get(pc)
-        .ok_or_else(|| "Truncated instruction".to_string())?;
-    let mut cursor = pc + 1;
-
-    let leb = |cursor: &mut usize, max: usize| -> Result<(), String> {
-        for _ in 0..max {
-            let byte = *code
-                .get(*cursor)
-                .ok_or_else(|| "Truncated immediate".to_string())?;
-            *cursor += 1;
-            if byte & 0x80 == 0 {
-                return Ok(());
-            }
-        }
-        Err("Immediate too long".to_string())
-    };
-    match opcode {
-        0x02..=0x04 => {
-            let block_type = *code
-                .get(cursor)
-                .ok_or_else(|| "Missing block type".to_string())?;
-            cursor += 1;
-            if !matches!(block_type, 0x40 | 0x7F | 0x7E | 0x7D | 0x7C) {
-                leb(&mut cursor, 5)?;
-            }
-        }
-        0x0C | 0x0D | 0x10 | 0x12 | 0x13 => leb(&mut cursor, 5)?,
-        0x11 => {
-            leb(&mut cursor, 5)?;
-            leb(&mut cursor, 5)?;
-        }
-        0x0E => {
-            let mut count = 0u32;
-            for shift in (0..20).step_by(7) {
-                let byte = *code
-                    .get(cursor)
-                    .ok_or_else(|| "Truncated br_table".to_string())?;
-                cursor += 1;
-                count |= u32::from(byte & 0x7F) << shift;
-                if byte & 0x80 == 0 {
-                    break;
-                }
-            }
-            for _ in 0..=count.min(MAX_LABELS as u32) {
-                leb(&mut cursor, 5)?;
-            }
-        }
-        0x1C => {
-            let mut count = 0u32;
-            for shift in (0..20).step_by(7) {
-                let byte = *code
-                    .get(cursor)
-                    .ok_or_else(|| "Truncated select_t".to_string())?;
-                cursor += 1;
-                count |= u32::from(byte & 0x7F) << shift;
-                if byte & 0x80 == 0 {
-                    break;
-                }
-            }
-            cursor = cursor.saturating_add(count.min(4) as usize);
-        }
-        0x20..=0x24 => leb(&mut cursor, 5)?,
-        0x28..=0x3E => {
-            leb(&mut cursor, 5)?;
-            leb(&mut cursor, 5)?;
-        }
-        0x3F | 0x40 => cursor += 1,
-        0x41 | 0x42 => leb(&mut cursor, 10)?,
-        0x43 => cursor += 4,
-        0x44 => cursor += 8,
-        _ => {}
-    }
-    Ok(cursor)
-}
-
-fn find_end(code: &[u8], pc: usize) -> Result<usize, String> {
-    let mut cursor = pc;
-    let mut depth = 0usize;
-    while cursor < code.len() {
-        match code[cursor] {
-            0x02..=0x04 => depth += 1,
-            0x0B => {
-                if depth == 0 {
-                    return Ok(cursor);
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-        cursor = skip_immediates(code, cursor)?;
-    }
-    Err("Unbalanced block: missing end".to_string())
-}
-
-fn find_else_or_end(code: &[u8], pc: usize) -> Result<usize, String> {
-    let mut cursor = pc;
-    let mut depth = 0usize;
-    while cursor < code.len() {
-        match code[cursor] {
-            0x02..=0x04 => depth += 1,
-            0x05 if depth == 0 => return Ok(cursor + 1),
-            0x0B if depth == 0 => return Ok(cursor + 1),
-            0x0B => depth -= 1,
-            _ => {}
-        }
-        cursor = skip_immediates(code, cursor)?;
-    }
-    Err("Unbalanced block: missing end".to_string())
-}
-
 #[derive(Debug)]
 enum Action {
     Continue,
@@ -2057,5 +1975,31 @@ mod spec_regression_tests {
         let mut instance = WasmInstance::instantiate(module).unwrap();
         let results = instance.invoke(0, &[]).unwrap();
         assert_eq!(results, vec![WasmValue::I32(7)]);
+    }
+
+    #[test]
+    fn five_byte_block_type_immediate_executes_cleanly() {
+        let module = build_fn_module(b"blockleb", &[0x02, 0x80, 0x80, 0x80, 0x80, 0x01, 0x0B]);
+        let mut instance = WasmInstance::instantiate(module).unwrap();
+        let error = instance.invoke(0, &[]).unwrap_err();
+        assert!(
+            error.contains("out of range") || error.contains("type"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn overlong_block_type_immediate_is_rejected_without_panicking() {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        bytes.extend([0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+        bytes.extend([0x03, 0x02, 0x01, 0x00]);
+        let body = body_no_locals(&[0x02, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x0B]);
+        bytes.extend(code_section(&[body]));
+        let error =
+            parse_module(&bytes).expect_err("six-byte block type immediate must be rejected");
+        assert!(
+            error.contains("immediate") || error.contains("too long"),
+            "got: {error}"
+        );
     }
 }

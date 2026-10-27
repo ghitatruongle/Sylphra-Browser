@@ -85,6 +85,11 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY_NOTICES.md") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "packaging\Run-Portable.bat") -Destination $stage
+    Get-ChildItem -LiteralPath $stage -File | ForEach-Object {
+        if ($_.LastWriteTime -lt [datetime]'1980-01-02' -or $_.LastWriteTime -gt [datetime]'2099-01-01') {
+            $_.LastWriteTime = Get-Date
+        }
+    }
 
     foreach ($stagedName in "sylphra.exe", "sylphra-renderer-worker.exe", "sylphra-browser-child.exe") {
         Assert-ProductVersion -Path (Join-Path $stage $stagedName) -ExpectedVersion $version

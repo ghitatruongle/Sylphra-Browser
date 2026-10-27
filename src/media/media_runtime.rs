@@ -19,6 +19,7 @@ pub struct MediaRuntimeLimits {
     pub max_video_frames: usize,
     pub max_audio_frames: usize,
     pub max_decoded_bytes: usize,
+    pub max_page_queued_bytes: usize,
     pub sync_tolerance_us: u64,
 }
 
@@ -31,6 +32,7 @@ impl Default for MediaRuntimeLimits {
             max_video_frames: 1_200,
             max_audio_frames: 16_384,
             max_decoded_bytes: crate::media_budget::MAX_DECODED_BYTES,
+            max_page_queued_bytes: crate::media_budget::MAX_MSE_QUEUED_ENCODED_BYTES,
             sync_tolerance_us: 40_000,
         }
     }
@@ -379,6 +381,25 @@ impl PageMediaRuntime {
         buffer_id: u32,
         bytes: &[u8],
     ) -> Result<AppendReport, String> {
+        let detached_queued: usize = self
+            .sources
+            .values()
+            .map(|binding| binding.source.as_ref().map_or(0, MediaSource::queued_bytes))
+            .sum();
+        let attached_queued: usize = self
+            .elements
+            .values()
+            .map(|binding| binding.element.media_source_queued_bytes())
+            .sum();
+        if detached_queued
+            .saturating_add(attached_queued)
+            .saturating_add(bytes.len())
+            > self.limits.max_page_queued_bytes
+        {
+            return Err(
+                "QuotaExceededError: page MediaSource queue exceeds its budget".to_string(),
+            );
+        }
         self.source_mut(source_id)?.append_buffer(buffer_id, bytes)
     }
 

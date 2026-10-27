@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -578,7 +578,12 @@ impl IndexedDBEngine {
             next_tx_id: 1,
             storage_path,
         };
-        let _ = engine.load_from_disk();
+        if let Err(error) = engine.load_from_disk() {
+            log::warn!("IndexedDB load failed for {:?}: {error}", engine.origin);
+            if let Err(backup_error) = engine.load_from_backup() {
+                log::warn!("IndexedDB backup load also failed: {backup_error}");
+            }
+        }
         engine
     }
 
@@ -680,7 +685,8 @@ impl IndexedDBEngine {
         }
         tx.committed = true;
         tx.rollback_snapshot = None;
-        let _ = self.save_to_disk();
+        self.save_to_disk()
+            .map_err(|error| format!("IndexedDB persistence failed: {error}"))?;
         Ok(())
     }
 
@@ -713,6 +719,8 @@ impl IndexedDBEngine {
     }
 
     fn save_to_disk(&self) -> std::io::Result<()> {
+        use std::io::Write;
+
         let Some(path) = &self.storage_path else {
             return Ok(());
         };
@@ -726,29 +734,49 @@ impl IndexedDBEngine {
             databases: &'a HashMap<String, IDBDatabase>,
         }
         let temporary = path.with_extension("tmp");
-        let file = fs::File::create(&temporary)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(
-            &mut writer,
-            &Persisted {
-                schema: 1,
-                origin: &self.origin,
-                databases: &self.databases,
-            },
-        )
-        .map_err(std::io::Error::other)?;
-        writer.flush()?;
-        drop(writer);
-        fs::rename(temporary, path)
+        let backup = path.with_extension("bak");
+        {
+            let file = fs::File::create(&temporary)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(
+                &mut writer,
+                &Persisted {
+                    schema: 1,
+                    origin: &self.origin,
+                    databases: &self.databases,
+                },
+            )
+            .map_err(std::io::Error::other)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .sync_all()?;
+        }
+        if path.exists() {
+            fs::rename(path, &backup)?;
+        }
+        if let Err(error) = fs::rename(&temporary, path) {
+            if backup.exists() && !path.exists() {
+                let _ = fs::rename(&backup, path);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
-    fn load_from_disk(&mut self) -> std::io::Result<()> {
+    fn load_from_backup(&mut self) -> std::io::Result<()> {
         let Some(path) = &self.storage_path else {
             return Ok(());
         };
-        if !path.exists() {
+        let backup = path.with_extension("bak");
+        if !backup.exists() {
             return Ok(());
         }
+        self.load_from_path(&backup)
+    }
+
+    fn load_from_path(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         #[derive(serde::Deserialize)]
         struct Persisted {
             schema: u32,
@@ -793,6 +821,16 @@ impl IndexedDBEngine {
         }
         self.databases = persisted.databases;
         Ok(())
+    }
+
+    fn load_from_disk(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.storage_path.clone() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        self.load_from_path(&path)
     }
 }
 

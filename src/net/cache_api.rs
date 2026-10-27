@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub const MAX_CACHES_PER_ORIGIN: usize = 64;
 pub const MAX_ENTRIES_PER_CACHE: usize = 500;
 pub const MAX_BODY_BYTES_PER_ENTRY: usize = 5 * 1024 * 1024;
+pub const MAX_TOTAL_CACHED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CacheEntry {
@@ -137,6 +138,52 @@ impl CacheStorage {
         self.caches.keys().cloned().collect()
     }
 
+    pub fn total_body_bytes(&self) -> usize {
+        self.caches
+            .values()
+            .map(|cache| {
+                cache
+                    .entries
+                    .iter()
+                    .map(|entry| entry.response_body.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    pub fn put_entry(
+        &mut self,
+        cache_name: &str,
+        request_url: impl Into<String>,
+        request_method: impl Into<String>,
+        response_status: u16,
+        response_headers: HashMap<String, String>,
+        response_body: Vec<u8>,
+    ) -> Result<(), String> {
+        let url = request_url.into();
+        let replaced = self
+            .caches
+            .get(cache_name)
+            .and_then(|cache| cache.match_req(&url))
+            .map_or(0, |entry| entry.response_body.len());
+        let projected = self
+            .total_body_bytes()
+            .saturating_add(response_body.len())
+            .saturating_sub(replaced);
+        if projected > MAX_TOTAL_CACHED_BYTES {
+            return Err(
+                "QuotaExceededError: cached responses exceed the origin budget".to_string(),
+            );
+        }
+        self.open(cache_name)?.put(
+            url,
+            request_method,
+            response_status,
+            response_headers,
+            response_body,
+        )
+    }
+
     pub fn match_all(&self, request_url: &str) -> Option<CacheEntry> {
         for cache in self.caches.values() {
             if let Some(entry) = cache.match_req(request_url) {
@@ -203,6 +250,23 @@ impl CacheStorage {
                 "CacheStorage origin/schema mismatch",
             ));
         }
+        let loaded_bytes: usize = persisted
+            .caches
+            .values()
+            .map(|cache| {
+                cache
+                    .entries
+                    .iter()
+                    .map(|entry| entry.response_body.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        if loaded_bytes > MAX_TOTAL_CACHED_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CacheStorage persistence exceeds the origin budget",
+            ));
+        }
         self.caches = persisted.caches;
         Ok(())
     }
@@ -239,5 +303,52 @@ mod tests {
 
         assert!(cache.delete("https://example.com/app.js"));
         assert_eq!(cache.keys().len(), 0);
+    }
+
+    #[test]
+    fn cache_storage_put_entry_enforces_total_budget() {
+        let mut cs = CacheStorage::new("https://example.com", None);
+        let body = vec![0u8; MAX_BODY_BYTES_PER_ENTRY];
+        for index in 0..51 {
+            let cache = format!("v{index}");
+            cs.put_entry(
+                &cache,
+                format!("https://example.com/{index}"),
+                "GET",
+                200,
+                HashMap::new(),
+                body.clone(),
+            )
+            .unwrap();
+        }
+        let error = cs
+            .put_entry(
+                "overflow",
+                "https://example.com/overflow",
+                "GET",
+                200,
+                HashMap::new(),
+                body,
+            )
+            .unwrap_err();
+        assert!(error.contains("QuotaExceeded"), "got: {error}");
+    }
+
+    #[test]
+    fn cache_put_entry_replacement_does_not_count_as_growth() {
+        let mut cs = CacheStorage::new("https://example.com", None);
+        let body = vec![0u8; 1_000];
+        for _ in 0..100 {
+            cs.put_entry(
+                "v1",
+                "https://example.com/app.js",
+                "GET",
+                200,
+                HashMap::new(),
+                body.clone(),
+            )
+            .unwrap();
+        }
+        assert_eq!(cs.total_body_bytes(), 1_000);
     }
 }

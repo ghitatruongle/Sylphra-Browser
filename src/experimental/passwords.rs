@@ -65,6 +65,10 @@ impl WindowsCredentialStore {
             return Err("Windows Credential Manager returned an empty credential".to_string());
         }
         let credential = unsafe { &*raw };
+        if credential.UserName.is_null() {
+            unsafe { CredFree(raw.cast()) };
+            return Err("Windows Credential Manager credential has no username".to_string());
+        }
         let stored_username = unsafe { credential.UserName.to_string() };
 
         if credential.CredentialBlobSize > 5 * 512 {
@@ -283,7 +287,7 @@ fn obfuscate(plain: &str, nonce: u64) -> String {
 }
 
 fn deobfuscate(encoded: &str) -> String {
-    if encoded.len() < 16 {
+    if encoded.len() < 16 || !encoded.is_char_boundary(16) {
         return String::new();
     }
     let (nonce_hex, hex) = encoded.split_at(16);

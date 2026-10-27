@@ -164,7 +164,8 @@ pub struct Browser {
     pub https_upgrade: https_upgrade::HttpsUpgradeEngine,
     pub cookie_blocker: tracking_protection::ThirdPartyCookieBlocker,
 
-    pub process_coordinator: Option<process_coordinator::BrowserProcessCoordinator>,
+    pub process_coordinator:
+        Option<std::sync::Arc<std::sync::Mutex<process_coordinator::BrowserProcessCoordinator>>>,
 
     pub renderer_fallback: bool,
 
@@ -187,6 +188,23 @@ impl Default for Browser {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub struct TabSpillJob {
+    pub tab_id: usize,
+    pub directory: std::path::PathBuf,
+    pub url: String,
+    pub dom: crate::parser::Element,
+    pub to_disk: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TabSpillOutcome {
+    pub tab_id: usize,
+    pub to_disk: bool,
+    pub ok: bool,
+    pub path: Option<String>,
+    pub payload: Vec<u8>,
 }
 
 impl Browser {
@@ -255,7 +273,7 @@ impl Browser {
             .storage_dir()
             .map(|dir| dir.join("webview2").display().to_string());
 
-        Self {
+        let mut browser = Self {
             tabs: TabManager::new(),
             viewport_width: 1100,
             viewport_height: 780,
@@ -296,16 +314,39 @@ impl Browser {
             updater,
             win_integration,
             acceptance: acceptance::AcceptanceReleaseManager::new(),
-        }
+        };
+        browser.sweep_stale_tab_snapshots();
+        browser
+    }
+
+    fn lock_coordinator(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, process_coordinator::BrowserProcessCoordinator>> {
+        let coordinator = self.process_coordinator.as_ref()?;
+        Some(match coordinator.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        })
+    }
+
+    fn try_lock_coordinator(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, process_coordinator::BrowserProcessCoordinator>> {
+        let coordinator = self.process_coordinator.as_ref()?;
+        Some(match coordinator.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        })
     }
 
     pub fn initialize_process_architecture(&mut self) -> Result<usize, String> {
-        if let Some(coordinator) = self.process_coordinator.as_ref() {
+        if let Some(coordinator) = self.lock_coordinator() {
             return Ok(coordinator.native_process_count());
         }
         let coordinator = process_coordinator::BrowserProcessCoordinator::discover()?;
         let count = coordinator.native_process_count();
-        self.process_coordinator = Some(coordinator);
+        self.process_coordinator = Some(std::sync::Arc::new(std::sync::Mutex::new(coordinator)));
         Ok(count)
     }
 
@@ -313,58 +354,50 @@ impl Browser {
         &mut self,
         program: impl AsRef<std::path::Path>,
     ) -> Result<usize, String> {
-        if let Some(coordinator) = self.process_coordinator.as_ref() {
+        if let Some(coordinator) = self.lock_coordinator() {
             return Ok(coordinator.native_process_count());
         }
         let coordinator = process_coordinator::BrowserProcessCoordinator::start(program)?;
         let count = coordinator.native_process_count();
-        self.process_coordinator = Some(coordinator);
+        self.process_coordinator = Some(std::sync::Arc::new(std::sync::Mutex::new(coordinator)));
         Ok(count)
     }
 
     pub fn attach_navigation_process(&mut self, tab_id: usize, url: &str) -> Result<(), String> {
-        if let Some(coordinator) = self.process_coordinator.as_mut() {
+        if let Some(mut coordinator) = self.try_lock_coordinator() {
             coordinator.attach_tab(tab_id, url)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_document_in_child(
-        &mut self,
+        coordinator: &std::sync::Arc<
+            std::sync::Mutex<process_coordinator::BrowserProcessCoordinator>,
+        >,
+        ledger: &resource_ledger::SharedLedger,
         tab_id: usize,
         url: &str,
         html: &str,
         base_rules: &[css_parser::CssRule],
+        viewport_width: u32,
+        viewport_height: u32,
     ) -> Option<document::PreparedDocument> {
-        let coordinator = match self.process_coordinator.as_mut() {
-            Some(coordinator) => coordinator,
-            None => {
-                self.renderer_fallback = true;
-                return None;
-            }
+        let mut guard = match coordinator.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        let ledger = self.resources.clone();
-        let viewport_width = self.viewport_width;
-        let viewport_height = self.viewport_height;
-        match coordinator.render_document(
-            &ledger,
-            tab_id,
-            url,
-            html,
-            base_rules,
-            viewport_width,
-            viewport_height,
-        ) {
-            Ok(prepared) => {
-                self.renderer_fallback = false;
-                Some(prepared)
-            }
-            Err(error) => {
-                log::warn!("renderer process could not render {url}: {error}");
-                self.renderer_fallback = true;
-                None
-            }
-        }
+        guard
+            .render_document(
+                ledger,
+                tab_id,
+                url,
+                html,
+                base_rules,
+                viewport_width,
+                viewport_height,
+            )
+            .ok()
     }
 
     fn apply_renderer_loss(&mut self, loss: process_coordinator::RendererLoss) -> Vec<String> {
@@ -513,14 +546,14 @@ impl Browser {
     }
 
     pub fn poll_renderer_memory(&mut self) -> Vec<String> {
-        let mut notes = Vec::new();
-        let losses = match self.process_coordinator.as_mut() {
-            Some(coordinator) => {
+        let losses = match self.try_lock_coordinator() {
+            Some(mut coordinator) => {
                 let ledger = self.resources.clone();
                 coordinator.poll_process_memory(&ledger)
             }
-            None => return notes,
+            None => return Vec::new(),
         };
+        let mut notes = Vec::new();
         for loss in losses {
             notes.extend(self.apply_renderer_loss(loss));
         }
@@ -529,7 +562,10 @@ impl Browser {
 
     pub fn shed_renderers(&mut self, shed_count: usize) -> Vec<String> {
         let mut scored: Vec<(String, i64)> = Vec::new();
-        if let Some(coordinator) = self.process_coordinator.as_ref() {
+        {
+            let Some(coordinator) = self.try_lock_coordinator() else {
+                return Vec::new();
+            };
             let active_id = self.tabs.active_tab_id();
             for (origin, process) in coordinator.renderer_origins() {
                 let tabs = coordinator.tabs_for_process(process);
@@ -552,11 +588,12 @@ impl Browser {
         scored.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         let mut notes = Vec::new();
         for (origin, _) in scored.into_iter().take(shed_count) {
-            let Some(coordinator) = self.process_coordinator.as_mut() else {
-                break;
-            };
             let ledger = self.resources.clone();
-            let Some(loss) = coordinator.shed_origin(&ledger, &origin) else {
+            let loss = match self.try_lock_coordinator() {
+                Some(mut coordinator) => coordinator.shed_origin(&ledger, &origin),
+                None => continue,
+            };
+            let Some(loss) = loss else {
                 continue;
             };
             notes.extend(self.apply_renderer_loss(loss));
@@ -1069,10 +1106,10 @@ impl Browser {
     }
 
     pub fn native_renderer_count(&self) -> usize {
-        self.process_coordinator
-            .as_ref()
-            .map(|coordinator| coordinator.native_process_count())
-            .unwrap_or_default()
+        match self.try_lock_coordinator() {
+            Some(coordinator) => coordinator.native_process_count(),
+            None => 0,
+        }
     }
 
     pub fn governance_summary(&mut self) -> task_manager::GovernanceSummary {
@@ -1116,6 +1153,29 @@ impl Browser {
             .map(|dir| dir.join("tab_snapshots"))
     }
 
+    pub fn sweep_stale_tab_snapshots(&mut self) -> usize {
+        let Some(directory) = self.snapshot_directory() else {
+            return 0;
+        };
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            let is_snapshot = name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("tab-") && name.ends_with(".gz"));
+            if is_snapshot && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     pub fn sync_tab_budgets(&mut self) -> usize {
         let ids: Vec<usize> = self.tabs.iter().map(|tab| tab.id).collect();
         let mut reconciled = 0usize;
@@ -1150,6 +1210,58 @@ impl Browser {
         reconciled
     }
 
+    pub fn collect_tab_spill_jobs(&self) -> Vec<TabSpillJob> {
+        let Some(directory) = self.snapshot_directory() else {
+            return Vec::new();
+        };
+        let active_id = self.tabs.active_tab_id();
+        let ids: Vec<usize> = self.tabs.iter().map(|tab| tab.id).collect();
+        let mut jobs = Vec::new();
+        for id in ids {
+            let Some(tab) = self.tabs.get_tab(id) else {
+                continue;
+            };
+            if tab.estimated_live_bytes() <= resource_caps::TAB_LIVE_BUDGET_BYTES {
+                continue;
+            }
+            if Some(id) == active_id || tab.is_disk_backed() || tab.is_discarded || tab.is_pinned {
+                continue;
+            }
+            jobs.push(TabSpillJob {
+                tab_id: id,
+                directory: directory.clone(),
+                url: tab.url.clone(),
+                dom: tab.dom.clone(),
+                to_disk: !tab.incognito,
+            });
+        }
+        jobs
+    }
+
+    pub fn commit_tab_spill(&mut self, outcome: TabSpillOutcome) -> usize {
+        if !outcome.ok {
+            return 0;
+        }
+        let active_id = self.tabs.active_tab_id();
+        if Some(outcome.tab_id) == active_id {
+            return 0;
+        }
+        let Some(tab) = self.tabs.get_tab_mut(outcome.tab_id) else {
+            return 0;
+        };
+        if tab.is_disk_backed() || tab.is_discarded || tab.is_pinned {
+            return 0;
+        }
+        if outcome.to_disk {
+            let Some(path) = outcome.path else {
+                return 0;
+            };
+            tab.commit_disk_spill_state(path)
+        } else {
+            tab.commit_ram_sleep_state(outcome.payload)
+        }
+    }
+
     pub fn enforce_tab_budgets(&mut self) -> usize {
         let Some(directory) = self.snapshot_directory() else {
             return 0;
@@ -1168,6 +1280,11 @@ impl Browser {
                 continue;
             };
             if tab.is_disk_backed() || tab.is_discarded || tab.is_pinned {
+                continue;
+            }
+            if tab.incognito {
+                let released = tab.sleep();
+                freed = freed.saturating_add(released);
                 continue;
             }
             match tab.spill_to_disk(&directory) {
@@ -1445,6 +1562,62 @@ fn resolve_url(base: &str, relative: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enforce_tab_budgets_sleeps_incognito_tabs_without_touching_disk() {
+        let root =
+            std::env::temp_dir().join(format!("sylphra_t2_incognito_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut browser = Browser::new_with_profile(&root, "profile").unwrap();
+
+        let filler = crate::parser::Element::new("body");
+        let active = browser
+            .tabs
+            .add_tab("https://a.test/", filler, "active filler");
+        let mut body = crate::parser::Element::new("body");
+        let node_budget = resource_caps::TAB_LIVE_BUDGET_BYTES
+            / crate::resource_caps::DOM_NODE_ESTIMATE_BYTES
+            + 1_000;
+        for _ in 0..node_budget {
+            body.children.push(crate::parser::Element::new("div"));
+        }
+        let id = browser
+            .tabs
+            .add_tab("https://b.test/", body, "incognito heavy");
+        browser.tabs.get_tab_mut(id).unwrap().incognito = true;
+        browser.tabs.set_active_tab(active);
+
+        let freed = browser.enforce_tab_budgets();
+        assert!(freed > 0);
+
+        let tab = browser.tabs.get_tab(id).unwrap();
+        assert!(tab.is_sleeping);
+        assert!(!tab.is_disk_backed());
+        assert!(tab.snapshot_path().is_none());
+        let directory = browser.snapshot_directory().unwrap();
+        let entries = std::fs::read_dir(&directory)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(entries, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_stale_tab_snapshots_removes_only_snapshot_files() {
+        let root = std::env::temp_dir().join(format!("sylphra_t2_sweep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut browser = Browser::new_with_profile(&root, "profile").unwrap();
+        let directory = browser.snapshot_directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("tab-1-0123456789abcdef.gz"), b"stale").unwrap();
+        std::fs::write(directory.join("notes.txt"), b"keep").unwrap();
+
+        let removed = browser.sweep_stale_tab_snapshots();
+        assert_eq!(removed, 1);
+        assert!(!directory.join("tab-1-0123456789abcdef.gz").exists());
+        assert!(directory.join("notes.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn test_browser_new() {

@@ -65,11 +65,8 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
         #[cfg(windows)]
         {
-            if replace_via_move_file(&temporary, path).is_err() {
-                if path.exists() {
-                    std::fs::remove_file(path)?;
-                }
-                std::fs::rename(&temporary, path)?;
+            if let Err(error) = replace_via_move_file(&temporary, path) {
+                std::fs::rename(&temporary, path).map_err(|_| error)?;
             }
         }
         #[cfg(not(windows))]

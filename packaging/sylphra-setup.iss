@@ -97,7 +97,6 @@ const
   LegacyExtensionList = '.html,.htm,.xhtml,.pdf';
   LegacyRootList = 'HKCU,HKLM,HKLM32';
   LegacyClassSuffixList = ',.Document,.HTMLDocument';
-  UninstallerList = 'unins000.exe,unins001.exe,unins002.exe,uninstall.exe,uninstaller.exe';
 
 function RootKeyAt(const Index: Integer): String;
 begin
@@ -122,26 +121,12 @@ begin
 end;
 
 function BuildProgramRoots: TStringList;
-var
-  LetterIndex: Integer;
-  Drive: String;
 begin
   Result := TStringList.Create;
   Result.Add(ExpandConstant('{pf}'));
   Result.Add(ExpandConstant('{pf32}'));
   Result.Add(ExpandConstant('{commonpf}'));
   Result.Add(ExpandConstant('{commonpf32}'));
-  for LetterIndex := 0 to 25 do
-  begin
-    Drive := Chr(Ord('A') + LetterIndex) + ':\';
-    if not DirExists(Drive) then
-      Continue;
-    Result.Add(Drive + 'Program Files');
-    Result.Add(Drive + 'Program Files (x86)');
-    Result.Add(Drive + 'ProgramData');
-    Result.Add(Drive + 'Users');
-    Result.Add(Drive);
-  end;
 end;
 
 function BuildDataRoots: TStringList;
@@ -167,37 +152,6 @@ begin
   Result.Add(ExpandConstant('{commonstartup}'));
 end;
 
-procedure RunUninstallerInside(const Folder: String; const Report: TStringList);
-var
-  Candidates: TStringList;
-  Index: Integer;
-  Path: String;
-  ResultCode: Integer;
-  RanAny: Boolean;
-begin
-  Candidates := TStringList.Create;
-  try
-    Candidates.CommaText := UninstallerList;
-    RanAny := False;
-    for Index := 0 to Candidates.Count - 1 do
-    begin
-      if RanAny then
-        Continue;
-      Path := Folder + '\' + Trim(Candidates[Index]);
-      if not FileExists(Path) then
-        Continue;
-      if Exec('"' + Path + '"', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '',
-        SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-        LogLine(Report, 'Ran legacy uninstaller: ' + Path)
-      else
-        LogLine(Report, 'Legacy uninstaller could not run, deleting folder instead: ' + Path);
-      RanAny := True;
-    end;
-  finally
-    Candidates.Free;
-  end;
-end;
-
 function SweepFolders(const Names: String; const Roots: TStringList;
   const Report: TStringList): Boolean;
 var
@@ -217,7 +171,6 @@ begin
         Candidate := Roots[RootIndex] + '\' + Trim(NameList[NameIndex]);
         if not DirExists(Candidate) then
           Continue;
-        RunUninstallerInside(Candidate, Report);
         if DeleteTreeIfPresent(Candidate) then
         begin
           LogLine(Report, 'Removed folder: ' + Candidate);

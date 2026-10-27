@@ -105,14 +105,24 @@ impl ChildProcessManager {
             self.processes.remove(&pid);
             return Err(error);
         }
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Browser child stdin is unavailable".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Browser child stdout is unavailable".to_string())?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.processes.remove(&pid);
+                return Err("Browser child stdin is unavailable".to_string());
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.processes.remove(&pid);
+                return Err("Browser child stdout is unavailable".to_string());
+            }
+        };
         let replies = spawn_reply_reader(stdout);
         self.native_processes.insert(
             pid,

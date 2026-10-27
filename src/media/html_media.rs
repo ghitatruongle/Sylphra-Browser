@@ -131,6 +131,12 @@ impl HtmlMediaElement {
         Ok(())
     }
 
+    pub fn media_source_queued_bytes(&self) -> usize {
+        self.media_source
+            .as_ref()
+            .map_or(0, MediaSource::queued_bytes)
+    }
+
     pub fn load_url(&mut self, url: &str) -> Result<(), String> {
         let parsed = url::Url::parse(url).map_err(|_| "Invalid media URL".to_string())?;
         if !matches!(parsed.scheme(), "http" | "https" | "file") {

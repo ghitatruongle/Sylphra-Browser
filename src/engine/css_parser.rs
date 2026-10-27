@@ -863,6 +863,8 @@ impl Selector {
     }
 }
 
+const MAX_SELECTOR_CHAIN_COMPONENTS: usize = 64;
+
 fn parse_selector_chain(input: &str) -> Option<Selector> {
     let mut components = Vec::new();
     let mut combinators = Vec::new();
@@ -936,6 +938,9 @@ fn parse_selector_chain(input: &str) -> Option<Selector> {
     }
 
     if components.is_empty() {
+        return None;
+    }
+    if components.len() > MAX_SELECTOR_CHAIN_COMPONENTS {
         return None;
     }
 
@@ -3225,11 +3230,7 @@ fn parse_css_with_context(
         return Vec::new();
     }
 
-    let css = if css.len() > crate::resource_caps::CSS_MAX_SOURCE_BYTES {
-        &css[..crate::resource_caps::CSS_MAX_SOURCE_BYTES]
-    } else {
-        css
-    };
+    let css = super::parser::bounded_prefix(css, crate::resource_caps::CSS_MAX_SOURCE_BYTES);
 
     let mut rules = Vec::new();
     let stripped = strip_css_comments(css);
@@ -4065,6 +4066,47 @@ mod tests {
         assert_eq!(rules[0].declarations.len(), 2);
         assert_eq!(rules[0].declarations[0].property, "color");
         assert_eq!(rules[0].declarations[0].value, "black");
+    }
+
+    #[test]
+    fn oversized_stylesheet_cut_does_not_panic_on_multibyte_boundary() {
+        let mut css = "a".repeat(crate::resource_caps::CSS_MAX_SOURCE_BYTES - 1);
+        css.push('é');
+        css.push_str("body{color:red}");
+        let rules = parse_css(&css);
+        let _ = rules;
+    }
+
+    #[test]
+    fn stylesheet_truncation_keeps_rules_within_budget() {
+        let mut css = String::new();
+        while css.len() + 32 < crate::resource_caps::CSS_MAX_SOURCE_BYTES {
+            css.push_str("p{color:red}");
+        }
+        while css.len() < crate::resource_caps::CSS_MAX_SOURCE_BYTES - 1 {
+            css.push('a');
+        }
+        css.push('é');
+        css.push_str("body{color:blue}");
+        let rules = parse_css(&css);
+        assert!(!rules.is_empty());
+    }
+
+    #[test]
+    fn selector_chain_over_component_cap_is_rejected() {
+        let mut selector = String::new();
+        for _ in 0..80 {
+            selector.push_str("div ");
+        }
+        selector.push('p');
+        assert!(parse_selector_chain(&selector).is_none());
+
+        let mut short = String::new();
+        for _ in 0..10 {
+            short.push_str("div ");
+        }
+        short.push('p');
+        assert!(parse_selector_chain(&short).is_some());
     }
 
     #[test]

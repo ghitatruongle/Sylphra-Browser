@@ -2,7 +2,30 @@
 
 All notable changes to Sylphra are documented here. The project follows Semantic Versioning.
 
-## [0.0.0-beta2] - Unreleased
+## [0.0.0] - 2026-10-25
+
+### Added
+- A dedicated compatibility governance module measuring the WebView2 host process tree against the shared ceiling table, with unit coverage and reconciled `WebView` ledger booking.
+- A `compat-webview2` feature backend completing the Chromium compatibility path: InPrivate mode for incognito tabs, subresource blocking through `WebResourceRequested`, bounded controller recycling, environment deadlines, and packaging of `WebView2Loader.dll` beside the executable.
+- Renderer hardening: block-target precomputation for the WASM interpreter, synchronous fuel charging for loops and collection scans, linear string natives (`indexOf`, `replace`, `split`, `replaceAll`, `matchAll`), a 64-component selector-chain cap, live-DOM orphan reclamation and attribute budgets, and UTF-8-boundary-safe truncation for oversized HTML, CSS and reader-mode input.
+- Security fixes: Authenticode signer lookup through `CERT_FIND_CERT_ID`, null-username guarding in the credential store, COM teardown ordering in the WASAPI sink, SSE worker disconnect handling, WebSocket write timeouts, kill-and-reap on child pipe failures, and a non-destructive atomic-rename fallback.
+- Persistence hardening: incognito tabs spill to memory instead of disk, snapshot restore rejects decompression bombs, stale `tab_snapshots` are swept at startup, IndexedDB writes are fsync-backed with `.bak` rotation and propagated commit errors, the Cache API enforces a 256 MB origin budget, MediaSource queues are bounded per page, and localStorage gains origin-count and total-byte ceilings.
+- Interface responsiveness: document preparation and memory-relief spills run off the interface thread, DevTools scripts run under a 200k-step budget, tab actions address tabs by identity, image batches repaint deterministically, and the task manager, find bar and suggestions read cached figures instead of re-scanning per frame.
+
+### Changed
+- Release packaging now stages through `packaging/package.ps1` inside CI with Inno Setup, artifact checksums and a post-upload evidence verification job.
+- The legacy-product sweep in the installer no longer executes uninstaller binaries and no longer scans every drive root.
+- Toolchain documentation reflects the validated 64 MB stack floor, and the README build instructions include `--features compat-webview2`.
+- `make-source-manifest.ps1` records tracked files only (`git ls-files`).
+
+### Fixed
+- The CI release job stages real packaged artifacts instead of a divergent hand-rolled file list.
+- The frozen source manifest excludes untracked and personal files.
+- The clean-VM release gate installs per-user (`/CURRENTUSER`) and now matches the installer's directory layout.
+- `THIRD_PARTY_NOTICES.md` lists `webview2-com` and the WebView2 `windows` bindings.
+- RustSec advisories for `quinn-proto`, `rustls`, `rustls-webpki`, `webpki-roots` and `webpki-root-certs` are resolved in `Cargo.lock`.
+
+## [0.0.0-beta2] - 2026-09-28
 
 ### Added
 - Governance groundwork for an on-demand Chromium compatibility backend: a dedicated `WebView` resource subsystem with its own ceiling, a `WebViewHost` process role bounded by a per-process memory limit and Windows job-object headroom, and a composite budget of 700 MB soft / 900 MB hard that applies only while a compatibility tab is live.

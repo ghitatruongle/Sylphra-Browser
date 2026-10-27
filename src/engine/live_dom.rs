@@ -580,6 +580,9 @@ impl LiveDocument {
         let LiveNodeKind::Element { attrs, .. } = &mut element.kind else {
             return Err("InvalidStateError: node is not an element".to_string());
         };
+        if !attrs.contains_key(name.as_str()) && attrs.len() >= MAX_ATTRS_PER_ELEMENT {
+            return Err("QuotaExceededError: attribute budget exceeded".to_string());
+        }
         attrs.insert(name.clone(), bounded_attribute(value));
         self.mark_attribute_mutated(name.as_str(), value);
         Ok(())
@@ -637,7 +640,12 @@ impl LiveDocument {
             .find(|record| record.root == root)
             .cloned()
             .ok_or_else(|| "NotFoundError: node is not a shadow root".to_string())?;
-        let previous = self.nodes[&root].children.clone();
+        let previous = self
+            .nodes
+            .get(&root)
+            .ok_or_else(|| "NotFoundError: node is not a shadow root".to_string())?
+            .children
+            .clone();
         for child in previous {
             self.free_subtree(child);
         }
@@ -929,9 +937,43 @@ impl LiveDocument {
         let Some(entry) = self.nodes.remove(&root) else {
             return;
         };
+        self.listeners.remove(&root);
+        self.canvas_shapes.remove(&root);
+        if !self.shadows.is_empty() {
+            self.shadows.remove(&root);
+            let stale_hosts: Vec<NodeId> = self
+                .shadows
+                .iter()
+                .filter(|(_, record)| record.root == root)
+                .map(|(host, _)| *host)
+                .collect();
+            for host in stale_hosts {
+                self.shadows.remove(&host);
+            }
+        }
         for child in entry.children {
             self.free_subtree(child);
         }
+    }
+
+    fn reclaim_orphans(&mut self) {
+        let mut reachable: BTreeSet<NodeId> = BTreeSet::new();
+        let mut queue: Vec<NodeId> = vec![self.root];
+        queue.extend(self.shadows.keys().copied());
+        queue.extend(self.listeners.keys().copied());
+        queue.extend(self.canvas_shapes.keys().copied());
+        if let Some(focused) = self.focused {
+            queue.push(focused);
+        }
+        while let Some(node) = queue.pop() {
+            if !reachable.insert(node) {
+                continue;
+            }
+            if let Some(entry) = self.nodes.get(&node) {
+                queue.extend(entry.children.iter().copied());
+            }
+        }
+        self.nodes.retain(|id, _| reachable.contains(id));
     }
 
     fn depth_budget_ok(&self, node: NodeId) -> Result<(), String> {
@@ -952,6 +994,9 @@ impl LiveDocument {
         kind: LiveNodeKind,
         preferred: Option<NodeId>,
     ) -> Result<NodeId, String> {
+        if self.nodes.len() >= MAX_LIVE_NODES {
+            self.reclaim_orphans();
+        }
         if self.nodes.len() >= MAX_LIVE_NODES {
             return Err("QuotaExceededError: live DOM node budget exceeded".to_string());
         }
@@ -1817,7 +1862,7 @@ fn bounded_text(value: &str) -> String {
 }
 
 fn bounded_attribute(value: &str) -> String {
-    value.chars().take(MAX_ATTRIBUTE_BYTES).collect()
+    super::parser::bounded_prefix(value, MAX_ATTRIBUTE_BYTES).to_string()
 }
 
 fn compact_children_html(element: &crate::parser::Element) -> String {
@@ -1878,6 +1923,47 @@ mod tests {
             Vec::new(),
             800,
         )
+    }
+
+    #[test]
+    fn remove_child_orphans_are_reclaimed_at_quota() {
+        let mut document = document();
+        let app = document.get_element_by_id("app").unwrap();
+        for _ in 0..MAX_LIVE_NODES {
+            let node = document.create_element("span").unwrap();
+            document.append_child(app, node).unwrap();
+            document.remove_child(app, node).unwrap();
+        }
+        assert!(document.create_element("span").is_ok());
+    }
+
+    #[test]
+    fn text_mutation_under_shadow_root_keeps_document_exportable() {
+        let mut document = document();
+        let app = document.get_element_by_id("app").unwrap();
+        let root = document.attach_shadow(app, ShadowMode::Open).unwrap();
+        document.set_shadow_html(root, "<p>inner</p>").unwrap();
+        document.set_text_content(app, "x").unwrap();
+        let exported = document.to_element_public();
+        assert!(
+            exported.find_tag("main").is_some(),
+            "document export lost the main element after a shadowed text mutation"
+        );
+    }
+
+    #[test]
+    fn set_attribute_enforces_per_element_budget() {
+        let mut document = document();
+        let app = document.get_element_by_id("app").unwrap();
+        for index in 0..(MAX_ATTRS_PER_ELEMENT - 1) {
+            let name = format!("data-field-{index}");
+            document.set_attribute(app, &name, "1").unwrap();
+        }
+        let error = document
+            .set_attribute(app, "data-overflow", "1")
+            .unwrap_err();
+        assert!(error.contains("QuotaExceeded"), "got: {error}");
+        document.set_attribute(app, "data-field-0", "2").unwrap();
     }
 
     #[test]

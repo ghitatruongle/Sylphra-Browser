@@ -346,7 +346,11 @@ impl ReaderModeExtractor {
 
         let mut content_html = content_elements.join("\n");
         if content_html.len() > MAX_HTML_BYTES {
-            content_html.truncate(MAX_HTML_BYTES);
+            let mut end = MAX_HTML_BYTES;
+            while end > 0 && !content_html.is_char_boundary(end) {
+                end -= 1;
+            }
+            content_html.truncate(end);
         }
         let mut text_content = text_parts.join(" ");
         if text_content.chars().count() > MAX_TEXT_CHARS {
