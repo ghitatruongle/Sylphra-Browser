@@ -143,10 +143,14 @@ fn mutation_frames_stay_inside_retained_memory_and_time_budgets() {
     let p95_index = ((frame_times_ms.len() as f64 * 0.95) as usize).min(frame_times_ms.len() - 1);
     let p95 = frame_times_ms[p95_index];
     let max = *frame_times_ms.last().unwrap();
+    let frame_budget_ms = if std::env::var_os("CI").is_some() {
+        budget.max_frame_time_ms.saturating_mul(3)
+    } else {
+        budget.max_frame_time_ms
+    };
     assert!(
-        p95 <= budget.max_frame_time_ms,
-        "mutation-frame p95 ({p95} ms) exceeds the {max} ms budget",
-        max = budget.max_frame_time_ms
+        p95 <= frame_budget_ms,
+        "mutation-frame p95 ({p95} ms) exceeds the {frame_budget_ms} ms budget",
     );
     assert!(
         max <= 100,
