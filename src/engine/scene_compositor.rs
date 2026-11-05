@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::paint::{DisplayItem, DisplayList, Rgba};
+use crate::paint::{gradient_color_at, DisplayItem, DisplayList, GradientStop, Rgba};
 
 const MAX_SCENE_PRIMITIVES: usize = 200_000;
 const MAX_DAMAGE_RECTS: usize = 4_096;
@@ -56,6 +57,40 @@ impl SceneRect {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ImagePixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
+}
+
+impl ImagePixels {
+    fn validated(self) -> Option<Self> {
+        let expected = self.width.saturating_mul(self.height).saturating_mul(4) as usize;
+        if expected == 0 || self.rgba.len() != expected {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedPixels(Arc<Vec<u8>>);
+
+impl PartialEq for SharedPixels {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::ops::Deref for SharedPixels {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScenePrimitive {
     SolidRect {
@@ -82,7 +117,38 @@ pub enum ScenePrimitive {
     ImagePlaceholder {
         id: u64,
         bounds: SceneRect,
+        url: String,
         ready: bool,
+    },
+    Image {
+        id: u64,
+        bounds: SceneRect,
+        url: String,
+        width: u32,
+        height: u32,
+        rgba: SharedPixels,
+    },
+    RoundedRect {
+        id: u64,
+        bounds: SceneRect,
+        color: Rgba,
+        radius: f32,
+        rotation: f32,
+    },
+    ShadowRect {
+        id: u64,
+        bounds: SceneRect,
+        color: Rgba,
+        radius: f32,
+        blur: f32,
+        rotation: f32,
+    },
+    GradientRect {
+        id: u64,
+        bounds: SceneRect,
+        angle: f32,
+        stops: Vec<GradientStop>,
+        rotation: f32,
     },
     VideoSurface {
         id: u64,
@@ -100,6 +166,10 @@ impl ScenePrimitive {
             | Self::Border { id, .. }
             | Self::Text { id, .. }
             | Self::ImagePlaceholder { id, .. }
+            | Self::Image { id, .. }
+            | Self::RoundedRect { id, .. }
+            | Self::ShadowRect { id, .. }
+            | Self::GradientRect { id, .. }
             | Self::VideoSurface { id, .. } => *id,
         }
     }
@@ -110,6 +180,10 @@ impl ScenePrimitive {
             | Self::Border { bounds, .. }
             | Self::Text { bounds, .. }
             | Self::ImagePlaceholder { bounds, .. }
+            | Self::Image { bounds, .. }
+            | Self::RoundedRect { bounds, .. }
+            | Self::ShadowRect { bounds, .. }
+            | Self::GradientRect { bounds, .. }
             | Self::VideoSurface { bounds, .. } => *bounds,
         }
     }
@@ -118,6 +192,8 @@ impl ScenePrimitive {
         std::mem::size_of::<Self>()
             + match self {
                 Self::Text { content, .. } => content.len(),
+                Self::Image { url, rgba, .. } => url.len() + rgba.len(),
+                Self::GradientRect { stops, .. } => stops.len() * 12,
                 Self::VideoSurface { rgba, .. } => rgba.len(),
                 _ => 0,
             }
@@ -191,15 +267,68 @@ impl RetainedScene {
                     bounds: SceneRect::new(shape.x, shape.y, shape.w, shape.h)?,
                     color: shape.fill.unwrap_or(crate::paint::Rgba::rgb(0.0, 0.0, 0.0)),
                 },
-                DisplayItem::Image { x, y, w, h, .. } => ScenePrimitive::ImagePlaceholder {
+                DisplayItem::Image {
+                    x, y, w, h, url, ..
+                } => ScenePrimitive::ImagePlaceholder {
                     id,
                     bounds: SceneRect::new(*x, *y, *w, *h)?,
+                    url: url.clone(),
                     ready: true,
                 },
-                DisplayItem::PendingImage { x, y, w, h, .. } => ScenePrimitive::ImagePlaceholder {
+                DisplayItem::PendingImage {
+                    x, y, w, h, url, ..
+                } => ScenePrimitive::ImagePlaceholder {
                     id,
                     bounds: SceneRect::new(*x, *y, *w, *h)?,
+                    url: url.clone(),
                     ready: false,
+                },
+                DisplayItem::RoundedRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    radius,
+                    rotation,
+                } => ScenePrimitive::RoundedRect {
+                    id,
+                    bounds: SceneRect::new(*x, *y, *w, *h)?,
+                    color: *color,
+                    radius: *radius,
+                    rotation: *rotation,
+                },
+                DisplayItem::ShadowRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    radius,
+                    blur,
+                    rotation,
+                } => ScenePrimitive::ShadowRect {
+                    id,
+                    bounds: SceneRect::new(*x, *y, *w, *h)?,
+                    color: *color,
+                    radius: *radius,
+                    blur: *blur,
+                    rotation: *rotation,
+                },
+                DisplayItem::GradientRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    angle,
+                    stops,
+                    rotation,
+                } => ScenePrimitive::GradientRect {
+                    id,
+                    bounds: SceneRect::new(*x, *y, *w, *h)?,
+                    angle: *angle,
+                    stops: stops.iter().copied().take(8).collect(),
+                    rotation: *rotation,
                 },
             };
             primitives.push(primitive);
@@ -228,6 +357,51 @@ impl RetainedScene {
 
     pub fn estimated_bytes(&self) -> usize {
         self.estimated_bytes
+    }
+
+    pub fn bind_images(&mut self, resolve: &dyn Fn(&str) -> Option<ImagePixels>) -> usize {
+        let mut bound = 0usize;
+        let mut damaged: Vec<SceneRect> = Vec::new();
+        for index in 0..self.primitives.len() {
+            let (id, bounds, url) = match &self.primitives[index] {
+                ScenePrimitive::ImagePlaceholder {
+                    id,
+                    bounds,
+                    url,
+                    ready: true,
+                } => (*id, *bounds, url.clone()),
+                _ => continue,
+            };
+            let Some(pixels) = resolve(&url).and_then(ImagePixels::validated) else {
+                continue;
+            };
+            let replacement = ScenePrimitive::Image {
+                id,
+                bounds,
+                url: url.clone(),
+                width: pixels.width,
+                height: pixels.height,
+                rgba: SharedPixels(pixels.rgba),
+            };
+            let projected = self
+                .estimated_bytes
+                .saturating_sub(self.primitives[index].estimated_bytes())
+                .saturating_add(replacement.estimated_bytes());
+            if projected > MAX_SCENE_BYTES {
+                continue;
+            }
+            self.estimated_bytes = projected;
+            damaged.push(bounds);
+            self.primitives[index] = replacement;
+            bound += 1;
+        }
+        for rect in damaged {
+            self.push_damage(rect);
+        }
+        if bound > 0 {
+            self.revision = self.revision.saturating_add(1);
+        }
+        bound
     }
 
     pub fn upsert_video_surface(
@@ -411,6 +585,49 @@ impl CpuCompositor {
                         Rgba::rgb(0.45, 0.45, 0.45)
                     },
                 ),
+                ScenePrimitive::Image {
+                    bounds,
+                    width: source_width,
+                    height: source_height,
+                    rgba: source,
+                    ..
+                } => blit_image_rgba(
+                    &mut rgba,
+                    width,
+                    height,
+                    *bounds,
+                    *source_width,
+                    *source_height,
+                    source,
+                ),
+                ScenePrimitive::RoundedRect {
+                    bounds,
+                    color,
+                    radius,
+                    rotation,
+                    ..
+                } => fill_rounded_rect(
+                    &mut rgba, width, height, *bounds, *color, *radius, *rotation,
+                ),
+                ScenePrimitive::ShadowRect {
+                    bounds,
+                    color,
+                    radius,
+                    blur,
+                    rotation,
+                    ..
+                } => fill_shadow_rect(
+                    &mut rgba, width, height, *bounds, *color, *radius, *blur, *rotation,
+                ),
+                ScenePrimitive::GradientRect {
+                    bounds,
+                    angle,
+                    stops,
+                    rotation,
+                    ..
+                } => {
+                    fill_gradient_rect(&mut rgba, width, height, *bounds, *angle, stops, *rotation)
+                }
                 ScenePrimitive::VideoSurface {
                     bounds,
                     width: source_width,
@@ -712,6 +929,241 @@ fn blit_surface(
             let target_offset = (target_y as usize * target_width as usize + target_x as usize) * 4;
             target[target_offset..target_offset + 4]
                 .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+}
+
+fn rotate_local_point(
+    bounds: SceneRect,
+    rotation_deg: f32,
+    pixel_x: f32,
+    pixel_y: f32,
+) -> Option<(f32, f32)> {
+    if rotation_deg.abs() < f32::EPSILON {
+        return if pixel_x >= bounds.x
+            && pixel_x < bounds.x + bounds.width
+            && pixel_y >= bounds.y
+            && pixel_y < bounds.y + bounds.height
+        {
+            Some((pixel_x, pixel_y))
+        } else {
+            None
+        };
+    }
+    let center_x = bounds.x + bounds.width * 0.5;
+    let center_y = bounds.y + bounds.height * 0.5;
+    let radians = rotation_deg.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let dx = pixel_x + 0.5 - center_x;
+    let dy = pixel_y + 0.5 - center_y;
+    let local_x = center_x + dx * cos + dy * sin;
+    let local_y = center_y - dx * sin + dy * cos;
+    if local_x < bounds.x
+        || local_x >= bounds.x + bounds.width
+        || local_y < bounds.y
+        || local_y >= bounds.y + bounds.height
+    {
+        return None;
+    }
+    Some((local_x, local_y))
+}
+
+fn rounded_box_sdf(rect: SceneRect, radius: f32, x: f32, y: f32) -> f32 {
+    let r = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
+    let half_w = rect.width * 0.5;
+    let half_h = rect.height * 0.5;
+    let qx = (x - (rect.x + half_w)).abs() - (half_w - r);
+    let qy = (y - (rect.y + half_h)).abs() - (half_h - r);
+    let ox = qx.max(0.0);
+    let oy = qy.max(0.0);
+    (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - r
+}
+
+fn blend_pixel(target: &mut [u8], offset: usize, color: Rgba) {
+    let alpha = (color.a.clamp(0.0, 1.0) * 255.0).round() as u16;
+    if alpha == 0 {
+        return;
+    }
+    let inverse = 255_u16.saturating_sub(alpha);
+    for (channel, component) in [color.r, color.g, color.b].iter().enumerate() {
+        let source = (component.clamp(0.0, 1.0) * 255.0).round() as u16;
+        target[offset + channel] =
+            ((source * alpha + u16::from(target[offset + channel]) * inverse) / 255) as u8;
+    }
+    target[offset + 3] = (alpha + u16::from(target[offset + 3]) * inverse / 255).min(255) as u8;
+}
+
+fn fill_rounded_rect(
+    target: &mut [u8],
+    target_width: u32,
+    target_height: u32,
+    rect: SceneRect,
+    color: Rgba,
+    radius: f32,
+    rotation: f32,
+) {
+    if color.a <= 0.0 {
+        return;
+    }
+    let left = rect.x.floor().max(0.0) as u32;
+    let top = rect.y.floor().max(0.0) as u32;
+    let right = (rect.x + rect.width).ceil().clamp(0.0, target_width as f32) as u32;
+    let bottom = (rect.y + rect.height)
+        .ceil()
+        .clamp(0.0, target_height as f32) as u32;
+    for y in top..bottom {
+        for x in left..right {
+            let Some((local_x, local_y)) = rotate_local_point(rect, rotation, x as f32, y as f32)
+            else {
+                continue;
+            };
+            if rounded_box_sdf(rect, radius, local_x, local_y) <= 0.0 {
+                blend_pixel(
+                    target,
+                    (y as usize * target_width as usize + x as usize) * 4,
+                    color,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_shadow_rect(
+    target: &mut [u8],
+    target_width: u32,
+    target_height: u32,
+    rect: SceneRect,
+    color: Rgba,
+    radius: f32,
+    blur: f32,
+    rotation: f32,
+) {
+    if color.a <= 0.0 {
+        return;
+    }
+    let blur = blur.max(1.0);
+    let shape = SceneRect {
+        x: rect.x + blur,
+        y: rect.y + blur,
+        width: (rect.width - 2.0 * blur).max(0.0),
+        height: (rect.height - 2.0 * blur).max(0.0),
+    };
+    let left = rect.x.floor().max(0.0) as u32;
+    let top = rect.y.floor().max(0.0) as u32;
+    let right = (rect.x + rect.width).ceil().clamp(0.0, target_width as f32) as u32;
+    let bottom = (rect.y + rect.height)
+        .ceil()
+        .clamp(0.0, target_height as f32) as u32;
+    for y in top..bottom {
+        for x in left..right {
+            let Some((local_x, local_y)) = rotate_local_point(rect, rotation, x as f32, y as f32)
+            else {
+                continue;
+            };
+            let distance = rounded_box_sdf(shape, radius, local_x, local_y);
+            if distance <= 0.0 {
+                continue;
+            }
+            let coverage = 1.0 - (distance / blur).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            blend_pixel(
+                target,
+                (y as usize * target_width as usize + x as usize) * 4,
+                Rgba {
+                    a: color.a * coverage,
+                    ..color
+                },
+            );
+        }
+    }
+}
+
+fn fill_gradient_rect(
+    target: &mut [u8],
+    target_width: u32,
+    target_height: u32,
+    rect: SceneRect,
+    angle: f32,
+    stops: &[GradientStop],
+    rotation: f32,
+) {
+    let radians = angle.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let dir_x = sin;
+    let dir_y = -cos;
+    let half_length = (rect.width * dir_x.abs() + rect.height * dir_y.abs()) * 0.5;
+    let center_x = rect.x + rect.width * 0.5;
+    let center_y = rect.y + rect.height * 0.5;
+    let left = rect.x.floor().max(0.0) as u32;
+    let top = rect.y.floor().max(0.0) as u32;
+    let right = (rect.x + rect.width).ceil().clamp(0.0, target_width as f32) as u32;
+    let bottom = (rect.y + rect.height)
+        .ceil()
+        .clamp(0.0, target_height as f32) as u32;
+    for y in top..bottom {
+        for x in left..right {
+            let Some((local_x, local_y)) = rotate_local_point(rect, rotation, x as f32, y as f32)
+            else {
+                continue;
+            };
+            if rounded_box_sdf(rect, 0.0, local_x, local_y) > 0.0 {
+                continue;
+            }
+            let projection = ((local_x - center_x) * dir_x + (local_y - center_y) * dir_y)
+                / half_length.max(1.0);
+            let color = gradient_color_at(stops, projection + 0.5);
+            blend_pixel(
+                target,
+                (y as usize * target_width as usize + x as usize) * 4,
+                color,
+            );
+        }
+    }
+}
+
+fn blit_image_rgba(
+    target: &mut [u8],
+    target_width: u32,
+    target_height: u32,
+    bounds: SceneRect,
+    source_width: u32,
+    source_height: u32,
+    source: &[u8],
+) {
+    let left = bounds.x.floor().max(0.0) as u32;
+    let top = bounds.y.floor().max(0.0) as u32;
+    let out_width = bounds.width.ceil().max(1.0) as u32;
+    let out_height = bounds.height.ceil().max(1.0) as u32;
+    for y in 0..out_height {
+        let target_y = top.saturating_add(y);
+        if target_y >= target_height {
+            break;
+        }
+        let source_y = (y as u64 * source_height as u64 / out_height as u64) as u32;
+        for x in 0..out_width {
+            let target_x = left.saturating_add(x);
+            if target_x >= target_width {
+                break;
+            }
+            let source_x = (x as u64 * source_width as u64 / out_width as u64) as u32;
+            let source_offset = (source_y as usize * source_width as usize + source_x as usize) * 4;
+            let alpha = u16::from(source[source_offset + 3]);
+            if alpha == 0 {
+                continue;
+            }
+            let target_offset = (target_y as usize * target_width as usize + target_x as usize) * 4;
+            let inverse = 255_u16.saturating_sub(alpha);
+            for channel in 0..3 {
+                target[target_offset + channel] = ((u16::from(source[source_offset + channel])
+                    * alpha
+                    + u16::from(target[target_offset + channel]) * inverse)
+                    / 255) as u8;
+            }
+            target[target_offset + 3] =
+                (alpha + u16::from(target[target_offset + 3]) * inverse / 255).min(255) as u8;
         }
     }
 }

@@ -1,4 +1,5 @@
 mod accessibility;
+mod animation_conformance;
 mod canvas_svg;
 mod css;
 mod css_conformance;
@@ -6,6 +7,10 @@ mod dom_runtime_backlog;
 mod dynamic_rendering;
 mod ecmascript;
 mod ecmascript_compatibility;
+mod form_interactions;
+mod gpu_paint_parity;
+mod grid_conformance;
+mod image_compositing;
 mod layout_conformance;
 mod live_dom;
 mod offline_spa;

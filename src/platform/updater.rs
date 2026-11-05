@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,7 @@ use crate::package_crypto::{
 const MAX_UPDATE_FILES: usize = 4_096;
 const MAX_UPDATE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_UPDATE_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_REMOTE_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 
 pub const PINNED_RELEASE_KEYS: &[(&str, &str)] = &[
     (
@@ -678,7 +679,7 @@ impl UpdateManager {
         if !journal_path.exists() {
             return Ok(false);
         }
-        let journal: UpdateJournal = read_bounded_json(&journal_path, MAX_MANIFEST_BYTES)?;
+        let journal: UpdateJournal = read_bounded_json(&journal_path, MAX_REMOTE_MANIFEST_BYTES)?;
         match journal.phase {
             JournalPhase::Staged => {
                 self.state = UpdateState::Idle;
@@ -788,7 +789,7 @@ impl UpdateManager {
 
     fn update_journal_phase(&self, phase: JournalPhase) -> Result<(), UpdateError> {
         let path = self.state_dir()?.join("journal.json");
-        let mut journal: UpdateJournal = read_bounded_json(&path, MAX_MANIFEST_BYTES)?;
+        let mut journal: UpdateJournal = read_bounded_json(&path, MAX_REMOTE_MANIFEST_BYTES)?;
         journal.phase = phase;
         atomic_json_write(&path, &journal)
     }
@@ -832,7 +833,7 @@ impl UpdateManager {
         if !path.exists() {
             return Ok(());
         }
-        let persisted: PersistedUpdaterState = read_bounded_json(&path, MAX_MANIFEST_BYTES)?;
+        let persisted: PersistedUpdaterState = read_bounded_json(&path, MAX_REMOTE_MANIFEST_BYTES)?;
         VersionComparer::parse_version(&persisted.current_version)?;
         self.current_version = persisted.current_version;
         self.state = persisted.state;
@@ -1083,4 +1084,80 @@ fn read_bounded_json<T: for<'de> Deserialize<'de>>(
 
 fn storage_error(error: std::io::Error) -> UpdateError {
     UpdateError::StorageError(error.to_string())
+}
+
+const MAX_NETWORK_MANIFEST_BYTES: usize = 1024 * 1024;
+
+pub fn parse_manifest(bytes: &[u8]) -> Result<UpdateManifest, UpdateError> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| UpdateError::InvalidManifest(format!("manifest JSON is invalid: {error}")))
+}
+
+fn update_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .redirects(2)
+        .user_agent(&crate::network::browser_ua())
+        .build()
+}
+
+fn validate_update_source(url: &str) -> Result<url::Url, UpdateError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| UpdateError::InvalidManifest("update source URL is invalid".into()))?;
+    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if parsed.scheme() != "https" && !loopback {
+        return Err(UpdateError::InvalidManifest(
+            "update source must use HTTPS outside loopback".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn fetch_manifest(url: &str) -> Result<UpdateManifest, UpdateError> {
+    validate_update_source(url)?;
+    let response = update_agent()
+        .get(url)
+        .call()
+        .map_err(|error| UpdateError::StorageError(format!("manifest fetch failed: {error}")))?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_NETWORK_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| UpdateError::StorageError(format!("manifest read failed: {error}")))?;
+    if bytes.len() > MAX_NETWORK_MANIFEST_BYTES {
+        return Err(UpdateError::InvalidManifest(
+            "manifest exceeds 1 MiB".into(),
+        ));
+    }
+    parse_manifest(&bytes)
+}
+
+pub fn download_update_package(url: &str, destination_dir: &Path) -> Result<PathBuf, UpdateError> {
+    validate_update_source(url)?;
+    let response = update_agent()
+        .get(url)
+        .call()
+        .map_err(|error| UpdateError::StorageError(format!("update download failed: {error}")))?;
+    fs::create_dir_all(destination_dir).map_err(storage_error)?;
+    let target = destination_dir.join("sylphra-update-package.bin");
+    let partial = destination_dir.join("sylphra-update-package.bin.part");
+    let mut file = fs::File::create(&partial).map_err(storage_error)?;
+    let mut reader = response.into_reader().take(MAX_UPDATE_PACKAGE_BYTES + 1);
+    std::io::copy(&mut reader, &mut file).map_err(storage_error)?;
+    drop(file);
+    let size = fs::metadata(&partial).map_err(storage_error)?.len();
+    if size > MAX_UPDATE_PACKAGE_BYTES {
+        let _ = fs::remove_file(&partial);
+        return Err(UpdateError::InvalidManifest(
+            "update package exceeds the 2 GiB budget".into(),
+        ));
+    }
+    fs::rename(&partial, &target).map_err(storage_error)?;
+    Ok(target)
+}
+
+pub fn update_source_url() -> &'static str {
+    "https://updates.sylphra.app/manifest.json"
 }

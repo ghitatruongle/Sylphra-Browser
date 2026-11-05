@@ -1,3 +1,4 @@
+use crate::css_parser::{parse_linear_gradient, CssUnit};
 use crate::layout::{effective_font_size, wrap_text_with_rules, DisplayType, LayoutNode};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,8 +47,35 @@ impl Rgba {
 
     pub const BLACK: Rgba = Rgba::rgb(0.067, 0.067, 0.067);
     pub const WHITE: Rgba = Rgba::rgb(1.0, 1.0, 1.0);
+    pub const TRANSPARENT: Rgba = Rgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    };
 
     pub const LINK_BLUE: Rgba = Rgba::rgb(0.102, 0.051, 0.671);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: Rgba,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearGradient {
+    pub angle_deg: f32,
+    pub stops: Vec<GradientStop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxShadowPaint {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Rgba,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +128,131 @@ pub enum DisplayItem {
         alt: String,
     },
 
+    RoundedRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: Rgba,
+        radius: f32,
+        rotation: f32,
+    },
+
+    ShadowRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: Rgba,
+        radius: f32,
+        blur: f32,
+        rotation: f32,
+    },
+
+    GradientRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        angle: f32,
+        stops: Vec<GradientStop>,
+        rotation: f32,
+    },
+
     VectorShape(VectorShape),
+}
+
+fn border_radius_px(radius: Option<&CssUnit>) -> f32 {
+    match radius {
+        Some(CssUnit::Pixels(value)) => value.max(0.0) as f32,
+        _ => 0.0,
+    }
+}
+
+pub fn parse_box_shadow(value: &str) -> Option<BoxShadowPaint> {
+    let text = value.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let color_start = ["rgb(", "rgba(", "hsl(", "hsla(", "#"]
+        .iter()
+        .filter_map(|prefix| text.find(prefix))
+        .min()?;
+    let (lengths, color_text) = text.split_at(color_start);
+    let color_end = if color_text.starts_with('#') {
+        color_text
+            .find(char::is_whitespace)
+            .unwrap_or(color_text.len())
+    } else {
+        color_text
+            .find(')')
+            .map(|close| close + 1)
+            .unwrap_or(color_text.len())
+    };
+    let color = parse_css_color(color_text[..color_end].trim())?;
+    let lengths = lengths
+        .split_whitespace()
+        .filter(|token| !token.eq_ignore_ascii_case("inset"))
+        .collect::<Vec<_>>();
+    if lengths.len() < 2 {
+        return None;
+    }
+    let parse_px = |token: &str| {
+        let token = token.trim();
+        token
+            .strip_suffix("px")
+            .unwrap_or(token)
+            .parse::<f32>()
+            .ok()
+    };
+    let offset_x = parse_px(lengths[0])?;
+    let offset_y = parse_px(lengths[1])?;
+    let blur = lengths
+        .get(2)
+        .and_then(|token| parse_px(token))
+        .unwrap_or(0.0);
+    let spread = lengths
+        .get(3)
+        .and_then(|token| parse_px(token))
+        .unwrap_or(0.0);
+    if ![offset_x, offset_y, blur, spread]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    Some(BoxShadowPaint {
+        offset_x,
+        offset_y,
+        blur: blur.clamp(0.0, 200.0),
+        spread: spread.clamp(-100.0, 100.0),
+        color,
+    })
+}
+
+pub fn gradient_color_at(stops: &[GradientStop], offset: f32) -> Rgba {
+    if stops.is_empty() {
+        return Rgba::TRANSPARENT;
+    }
+    let offset = offset.clamp(0.0, 1.0);
+    if offset <= stops[0].offset {
+        return stops[0].color;
+    }
+    for window in stops.windows(2) {
+        if offset <= window[1].offset {
+            let span = (window[1].offset - window[0].offset).max(f32::EPSILON);
+            let blend = ((offset - window[0].offset) / span).clamp(0.0, 1.0);
+            let left = window[0].color;
+            let right = window[1].color;
+            return Rgba {
+                r: left.r + (right.r - left.r) * blend,
+                g: left.g + (right.g - left.g) * blend,
+                b: left.b + (right.b - left.b) * blend,
+                a: left.a + (right.a - left.a) * blend,
+            };
+        }
+    }
+    stops[stops.len() - 1].color
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,10 +283,29 @@ pub struct LinkRegion {
     pub href: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormControlKind {
+    TextInput,
+    Select,
+    Button,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormControlRegion {
+    pub node_id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub kind: FormControlKind,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DisplayList {
     pub items: Vec<DisplayItem>,
     pub links: Vec<LinkRegion>,
+    pub form_controls: Vec<FormControlRegion>,
 
     pub width: f32,
     pub height: f32,
@@ -176,6 +347,9 @@ impl DisplayList {
                 DisplayItem::Image { y, h, .. } => (y + h) >= min_y && *y <= max_y,
                 DisplayItem::PendingImage { y, h, .. } => (y + h) >= min_y && *y <= max_y,
                 DisplayItem::TextRun { y, size, .. } => (y + size) >= min_y && *y <= max_y,
+                DisplayItem::RoundedRect { y, h, .. } => (y + h) >= min_y && *y <= max_y,
+                DisplayItem::ShadowRect { y, h, .. } => (y + h) >= min_y && *y <= max_y,
+                DisplayItem::GradientRect { y, h, .. } => (y + h) >= min_y && *y <= max_y,
                 DisplayItem::VectorShape(shape) => (shape.y + shape.h) >= min_y && shape.y <= max_y,
             })
             .cloned()
@@ -184,6 +358,7 @@ impl DisplayList {
         DisplayList {
             items,
             links: self.links.clone(),
+            form_controls: self.form_controls.clone(),
             width: self.width,
             height: self.height,
         }
@@ -221,6 +396,22 @@ pub fn calculate_visible_metrics(
                 }
             }
             DisplayItem::Image { w, h, .. } | DisplayItem::PendingImage { w, h, .. } => {
+                total_painted_area += w * h;
+                meaningful_items += 1;
+            }
+            DisplayItem::RoundedRect { w, h, color, .. } => {
+                if color.a > 0.05 {
+                    total_painted_area += w * h;
+                    meaningful_items += 1;
+                }
+            }
+            DisplayItem::ShadowRect { w, h, color, .. } => {
+                if color.a > 0.05 {
+                    total_painted_area += w * h;
+                    meaningful_items += 1;
+                }
+            }
+            DisplayItem::GradientRect { w, h, .. } => {
                 total_painted_area += w * h;
                 meaningful_items += 1;
             }
@@ -461,18 +652,45 @@ pub fn paint_stacking_context(
     let h = node.rect.height as f32;
 
     if is_visible && tag != "html" && tag != "body" {
-        if node.computed_style.box_shadow.is_some() {
-            if let Some((cx, cy, cw, ch)) = clipped_rect(x + 2.0, y + 2.0, w, h, clip) {
-                list.items.push(DisplayItem::Rect {
+        let rotation = node.computed_style.transform.rotation_deg as f32;
+        let radius = border_radius_px(node.computed_style.border_radius.as_ref());
+        if let Some(shadow) = node
+            .computed_style
+            .box_shadow
+            .as_deref()
+            .and_then(parse_box_shadow)
+        {
+            let blur = shadow.blur.max(1.0);
+            let expand = shadow.spread + blur;
+            let sx = x + shadow.offset_x - expand;
+            let sy = y + shadow.offset_y - expand;
+            let sw = w + 2.0 * expand;
+            let sh = h + 2.0 * expand;
+            if let Some((cx, cy, cw, ch)) = clipped_rect(sx, sy, sw, sh, clip) {
+                list.items.push(DisplayItem::ShadowRect {
                     x: cx,
                     y: cy,
                     w: cw,
                     h: ch,
-                    color: mul_alpha(Rgba::rgb(0.0, 0.0, 0.0), opacity * 0.15),
+                    color: mul_alpha(shadow.color, opacity),
+                    radius: (radius + blur).max(0.0),
+                    blur,
+                    rotation,
                 });
             }
         }
 
+        let gradient = node
+            .computed_style
+            .background_image
+            .as_deref()
+            .filter(|image| {
+                image
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("linear-gradient(")
+            })
+            .and_then(parse_linear_gradient);
         if let Some(bg) = node
             .computed_style
             .background_color
@@ -480,13 +698,76 @@ pub fn paint_stacking_context(
             .and_then(parse_css_color)
         {
             if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
-                list.items.push(DisplayItem::Rect {
+                match gradient {
+                    Some(gradient) => list.items.push(DisplayItem::GradientRect {
+                        x: cx,
+                        y: cy,
+                        w: cw,
+                        h: ch,
+                        angle: gradient.angle_deg,
+                        stops: gradient.stops,
+                        rotation,
+                    }),
+                    None if radius > 0.0 || rotation.abs() > f32::EPSILON => {
+                        list.items.push(DisplayItem::RoundedRect {
+                            x: cx,
+                            y: cy,
+                            w: cw,
+                            h: ch,
+                            color: mul_alpha(bg, opacity),
+                            radius,
+                            rotation,
+                        })
+                    }
+                    None => list.items.push(DisplayItem::Rect {
+                        x: cx,
+                        y: cy,
+                        w: cw,
+                        h: ch,
+                        color: mul_alpha(bg, opacity),
+                    }),
+                }
+            }
+        } else if let Some(gradient) = gradient {
+            if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
+                list.items.push(DisplayItem::GradientRect {
                     x: cx,
                     y: cy,
                     w: cw,
                     h: ch,
-                    color: mul_alpha(bg, opacity),
+                    angle: gradient.angle_deg,
+                    stops: gradient.stops,
+                    rotation,
                 });
+            }
+        }
+
+        if is_visible && matches!(tag, "input" | "textarea" | "select" | "button") {
+            if let Some(node_id) = node.element.node_id {
+                let kind = match tag {
+                    "button" => FormControlKind::Button,
+                    "select" => FormControlKind::Select,
+                    _ => FormControlKind::TextInput,
+                };
+                let value = match tag {
+                    "button" | "select" => node.element.text_content(),
+                    _ => node
+                        .element
+                        .get_attr("value")
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                };
+                if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
+                    list.form_controls.push(FormControlRegion {
+                        node_id,
+                        x: cx,
+                        y: cy,
+                        w: cw,
+                        h: ch,
+                        kind,
+                        value,
+                    });
+                }
             }
         }
 

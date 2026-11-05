@@ -181,6 +181,8 @@ pub struct Browser {
 
     pub win_integration: windows_integration::WindowsIntegration,
 
+    pub password_vault: password_vault::PasswordVault,
+
     pub acceptance: acceptance::AcceptanceReleaseManager,
 }
 
@@ -239,6 +241,7 @@ impl Browser {
             ..Default::default()
         });
 
+        let vault_path = vault_path(storage.storage_dir());
         let (extension_manager, app_manager, updater, win_integration) = match storage.storage_dir()
         {
             Some(dir) => (
@@ -313,10 +316,25 @@ impl Browser {
             app_manager,
             updater,
             win_integration,
+            password_vault: match vault_path {
+                Some(path) => password_vault::PasswordVault::load(&path),
+                None => password_vault::PasswordVault::default(),
+            },
             acceptance: acceptance::AcceptanceReleaseManager::new(),
         };
         browser.sweep_stale_tab_snapshots();
         browser
+    }
+
+    pub fn vault_file_path(&self) -> Option<std::path::PathBuf> {
+        vault_path(self.storage.storage_dir())
+    }
+
+    pub fn save_password_vault(&self) -> Result<(), String> {
+        match self.vault_file_path() {
+            Some(path) => self.password_vault.save(&path),
+            None => Err("Password vault has no storage directory".to_string()),
+        }
     }
 
     fn lock_coordinator(
@@ -1494,6 +1512,10 @@ impl Drop for Browser {
     fn drop(&mut self) {
         self.storage.set_session(self.tabs.session_snapshot());
     }
+}
+
+fn vault_path(storage_dir: Option<&std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    storage_dir.map(|dir| dir.join("password_vault.json"))
 }
 
 fn extract_title_from_dom(dom: &Element) -> String {

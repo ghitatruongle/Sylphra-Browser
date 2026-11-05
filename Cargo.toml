@@ -1,6 +1,6 @@
 [package]
 name = "sylphra"
-version = "0.0.0"
+version = "0.0.1-preview"
 edition = "2021"
 authors = ["Sylphra"]
 description = "A lightweight document-focused browser written in safe Rust"

@@ -50,3 +50,12 @@ fn test_resource_cache_size_limit() {
     assert!(cache.get("https://large.com").is_none());
     assert!(cache.total_bytes() <= 100);
 }
+
+#[test]
+fn cookies_stop_matching_after_expiry() {
+    let cookie = sylphra::storage::Cookie::from_set_cookie_header(
+        "sid=abc; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        "example.com",
+    );
+    assert!(!cookie.matches_url("https://example.com/"));
+}

@@ -1,19 +1,22 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Instant;
 
-use crate::css_parser::{parse_class_attr, ComputedStyle, CssRule, Transform2D};
+use crate::css_parser::{parse_class_attr, ComputedStyle, CssRule, KeyframesRule, Transform2D};
 use crate::layout::{self, LayoutNode};
 use crate::live_dom::NodeId;
 use crate::paint::{self, DisplayList};
 use crate::parser::Element;
-use crate::scene_compositor::RetainedScene;
+use crate::scene_compositor::{ImagePixels, RetainedScene};
 
 const MAX_STYLE_CACHE_ENTRIES: usize = 50_000;
 const MAX_ACTIVE_ANIMATIONS: usize = 4_096;
 const MAX_ANIMATION_DURATION_MS: u64 = 60_000;
 const ESTIMATED_STYLE_CACHE_BYTES: usize = 768;
 const ESTIMATED_DISPLAY_ITEM_BYTES: usize = 128;
+
+pub type ImageResolverFn = dyn Fn(&str) -> Option<ImagePixels> + Send + Sync;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DynamicInvalidation {
@@ -86,6 +89,19 @@ struct StyleSnapshot {
 enum AnimatedProperty {
     Opacity { from: f64, to: f64 },
     Transform { from: Transform2D, to: Transform2D },
+    Timeline(Arc<KeyframeTimeline>),
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct KeyframeTimeline {
+    pub samples: Vec<KeyframeSample>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyframeSample {
+    pub offset: f32,
+    pub opacity: Option<f64>,
+    pub transform: Option<Transform2D>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +112,7 @@ struct ActiveAnimation {
     remaining_iterations: u16,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct DynamicRenderer {
     style_cache: BTreeMap<NodeId, CachedStyle>,
     base_layout: Option<LayoutNode>,
@@ -105,6 +121,21 @@ pub struct DynamicRenderer {
     previous_styles: BTreeMap<NodeId, ComputedStyle>,
     animations: BTreeMap<NodeId, Vec<ActiveAnimation>>,
     revision: u64,
+    image_resolver: Option<Arc<ImageResolverFn>>,
+    keyframes: BTreeMap<String, KeyframesRule>,
+}
+
+impl std::fmt::Debug for DynamicRenderer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicRenderer")
+            .field("style_cache", &self.style_cache.len())
+            .field("retained_scene", &self.retained_scene.is_some())
+            .field("animations", &self.active_animation_count())
+            .field("revision", &self.revision)
+            .field("image_resolver", &self.image_resolver.is_some())
+            .finish()
+    }
 }
 
 impl DynamicRenderer {
@@ -114,6 +145,10 @@ impl DynamicRenderer {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub fn set_image_resolver(&mut self, resolver: Option<Arc<ImageResolverFn>>) {
+        self.image_resolver = resolver;
     }
 
     pub fn style_cache_len(&self) -> usize {
@@ -160,6 +195,15 @@ impl DynamicRenderer {
         invalidation: DynamicInvalidation,
     ) -> DynamicRenderFrame {
         let started = Instant::now();
+        self.keyframes = rules
+            .iter()
+            .filter_map(|rule| {
+                rule.keyframes
+                    .as_ref()
+                    .map(|keyframes| (keyframes.name.clone(), keyframes.clone()))
+            })
+            .take(64)
+            .collect();
         let needs_snapshot =
             invalidation.style || invalidation.layout || self.base_layout.is_none();
         let snapshot = if needs_snapshot {
@@ -241,9 +285,12 @@ impl DynamicRenderer {
             layout
         };
         let scene = if rebuild_display {
-            let next =
+            let mut next =
                 RetainedScene::from_display_list(self.revision.saturating_add(1), &display_list)
                     .unwrap_or_default();
+            if let Some(resolver) = self.image_resolver.as_ref() {
+                next.bind_images(&|url| resolver(url));
+            }
             if let Some(retained) = self.retained_scene.as_mut() {
                 retained.update_from(next);
             } else {
@@ -336,6 +383,22 @@ impl DynamicRenderer {
             return;
         }
         let iterations = style.animation_iterations.clamp(1, 1_000);
+        if let Some(name) = style.animation_name.as_deref() {
+            if let Some(rule) = self.keyframes.get(name) {
+                if let Some(timeline) = build_timeline_from_rule(rule) {
+                    self.push_animation(
+                        node,
+                        ActiveAnimation {
+                            property: AnimatedProperty::Timeline(Arc::new(timeline)),
+                            elapsed_ms: 0,
+                            duration_ms: duration,
+                            remaining_iterations: iterations,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
         match style.animation_name.as_deref() {
             Some("sylphra-fade-in") | Some("ghita-fade-in") => self.push_animation(
                 node,
@@ -564,9 +627,9 @@ fn apply_animation_overrides(
         if let Some(entries) = animations.get(&node_id) {
             for animation in entries {
                 let progress = animation_progress(animation);
-                match animation.property {
+                match &animation.property {
                     AnimatedProperty::Opacity { from, to } => {
-                        node.computed_style.opacity = Some(interpolate(from, to, progress));
+                        node.computed_style.opacity = Some(interpolate(*from, *to, progress));
                     }
                     AnimatedProperty::Transform { from, to } => {
                         let base = node.computed_style.transform;
@@ -575,6 +638,7 @@ fn apply_animation_overrides(
                             translate_y: interpolate(from.translate_y, to.translate_y, progress),
                             scale_x: interpolate(from.scale_x, to.scale_x, progress),
                             scale_y: interpolate(from.scale_y, to.scale_y, progress),
+                            rotation_deg: interpolate(from.rotation_deg, to.rotation_deg, progress),
                         };
                         node.rect.x += transform.translate_x - base.translate_x;
                         node.rect.y += transform.translate_y - base.translate_y;
@@ -584,6 +648,24 @@ fn apply_animation_overrides(
                             * transform.scale_y)
                             .max(0.0);
                         node.computed_style.transform = transform;
+                    }
+                    AnimatedProperty::Timeline(timeline) => {
+                        let (opacity, transform) = sample_timeline(timeline, progress);
+                        if let Some(opacity) = opacity {
+                            node.computed_style.opacity = Some(opacity);
+                        }
+                        if let Some(transform) = transform {
+                            let base = node.computed_style.transform;
+                            node.rect.x += transform.translate_x - base.translate_x;
+                            node.rect.y += transform.translate_y - base.translate_y;
+                            node.rect.width = (node.rect.width / base.scale_x.max(0.01)
+                                * transform.scale_x)
+                                .max(0.0);
+                            node.rect.height = (node.rect.height / base.scale_y.max(0.01)
+                                * transform.scale_y)
+                                .max(0.0);
+                            node.computed_style.transform = transform;
+                        }
                     }
                 }
             }
@@ -597,6 +679,84 @@ fn apply_animation_overrides(
 fn animation_progress(animation: &ActiveAnimation) -> f64 {
     let duration = animation.duration_ms.max(1);
     (animation.elapsed_ms.min(duration) as f64 / duration as f64).clamp(0.0, 1.0)
+}
+
+fn build_timeline_from_rule(rule: &KeyframesRule) -> Option<KeyframeTimeline> {
+    let mut samples: Vec<KeyframeSample> = rule
+        .steps
+        .iter()
+        .map(|step| KeyframeSample {
+            offset: step.offset,
+            opacity: step
+                .declarations
+                .iter()
+                .find(|(property, _)| property == "opacity")
+                .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+                .map(|value| value.clamp(0.0, 1.0)),
+            transform: step
+                .declarations
+                .iter()
+                .find(|(property, _)| property == "transform")
+                .and_then(|(_, value)| Transform2D::parse(value.trim())),
+        })
+        .filter(|sample| sample.offset.is_finite())
+        .collect();
+    if samples.len() < 2 {
+        return None;
+    }
+    samples.sort_by(|a, b| {
+        a.offset
+            .partial_cmp(&b.offset)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(KeyframeTimeline { samples })
+}
+
+fn sample_timeline(
+    timeline: &KeyframeTimeline,
+    progress: f64,
+) -> (Option<f64>, Option<Transform2D>) {
+    if timeline.samples.is_empty() {
+        return (None, None);
+    }
+    let progress = progress.clamp(0.0, 1.0) as f32;
+    let first = &timeline.samples[0];
+    if progress <= first.offset {
+        return (first.opacity, first.transform);
+    }
+    let last = &timeline.samples[timeline.samples.len() - 1];
+    if progress >= last.offset {
+        return (last.opacity, last.transform);
+    }
+    for window in timeline.samples.windows(2) {
+        let (a, b) = (&window[0], &window[1]);
+        if progress <= b.offset {
+            let span = (b.offset - a.offset).max(f32::EPSILON);
+            let blend = (((progress - a.offset) / span).clamp(0.0, 1.0)) as f64;
+            let opacity = match (a.opacity, b.opacity) {
+                (Some(a), Some(b)) => Some(interpolate(a, b, blend)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+            let transform = match (a.transform, b.transform) {
+                (Some(a), Some(b)) => Some(interpolate_transform(a, b, blend)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+            return (opacity, transform);
+        }
+    }
+    (last.opacity, last.transform)
+}
+
+fn interpolate_transform(from: Transform2D, to: Transform2D, blend: f64) -> Transform2D {
+    Transform2D {
+        translate_x: interpolate(from.translate_x, to.translate_x, blend),
+        translate_y: interpolate(from.translate_y, to.translate_y, blend),
+        scale_x: interpolate(from.scale_x, to.scale_x, blend),
+        scale_y: interpolate(from.scale_y, to.scale_y, blend),
+        rotation_deg: interpolate(from.rotation_deg, to.rotation_deg, blend),
+    }
 }
 
 fn interpolate(from: f64, to: f64, progress: f64) -> f64 {

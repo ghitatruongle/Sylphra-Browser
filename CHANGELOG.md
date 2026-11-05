@@ -2,6 +2,28 @@
 
 All notable changes to Sylphra are documented here. The project follows Semantic Versioning.
 
+## [0.0.1-preview] - 2026-11-03
+
+### Added
+- The rendering scene carries real decoded image pixels: a shared, byte-budgeted `Image` primitive feeds both the CPU and GPU compositors, and `DynamicRenderer` binds decoded images through an injectable resolver. The interface layer drops its `try_unwrap` handle hack in favor of the shared pixel buffer.
+- GPU paint parity: `border-radius` fills, blurred `box-shadow` falloff, `linear-gradient` backgrounds (up to eight stops) and `transform: rotate()` are parsed, painted by the CPU compositor and routed through new GPU shader kinds, with interface-canvas parity for rounded rects, layered shadows, strip-sampled gradients and rotation.
+- A real CSS Grid layout engine: `grid-template-columns`/`rows` accept `fr`, pixel, percent, `auto`, `minmax()`, `fit-content()` and `repeat()` including `auto-fit`/`auto-fill`, with column and row spanning distributed across tracks and a bounded placement pass replacing the equal-column fallback.
+- `@keyframes` support: stylesheet parsing of `@keyframes` (bounded steps and declarations) feeds a named-animation timeline in the dynamic renderer that interpolates opacity and transforms per frame, alongside the existing transition engine.
+- Interactive forms: password fields, focus and blur flow through click default actions, keyboard input with Backspace support updates input values, selects cycle options, and GET form submissions build a resolved query URL that navigates the tab. Form control regions are exposed on the display list for hit testing.
+- A DPAPI-backed password vault (`platform/password_vault.rs`): protected blobs never store plaintext on disk, tampered blobs fail closed, HTTPS-only origins are enforced, and the vault persists per profile with save-on-submit autofill, a settings management section and deletion.
+- An updater network layer: manifest fetch and package download over HTTPS (loopback HTTP allowed) with byte budgets, `parse_manifest`/`fetch_manifest`/`download_update_package` helpers and a user-initiated "Check for updates" action in settings.
+- Favicons: a bounded LRU store fetches and downscales site icons, and the tab strip shows real favicons for loaded origins.
+- Reader mode toggle in the toolbar (Ctrl+Shift+R) distilling the page into readable paragraphs, and find-in-page now offers next/previous navigation with a "current of total" counter.
+- EasyList-compatible filter loading: `||domain^` network rules with `$script`, `$image`, `$stylesheet`, `$third-party`, `$domain=` options and `@@` exceptions load into the existing blocker with a 50k-rule ceiling.
+- Cookie matching now refuses expired cookies, and the HTTP resource cache revalidates stale entries with `ETag`/`If-None-Match` in addition to `Last-Modified`.
+
+### Changed
+- The interface renders form controls from display-list regions instead of guesswork, and the tab strip label pipeline was restructured around a bounded row builder.
+- Library and engine test suites grew by 30+ cases covering image compositing, paint parity, grid conformance, keyframes, form interactions, the password vault, updater parsing, EasyList vectors and cookie expiry.
+
+### Fixed
+- `transform: rotate()` no longer discards the whole transform declaration, and animated transforms keep their rotation component.
+
 ## [0.0.0] - 2026-10-25
 
 ### Added

@@ -571,6 +571,127 @@ fn is_local_or_loopback(host: &str) -> bool {
         .is_ok_and(|address| address.is_loopback())
 }
 
+const MAX_EASYLIST_RULES: usize = 50_000;
+
+impl AdBlocker {
+    pub fn load_easylist(&mut self, text: &str) -> (usize, usize) {
+        let mut loaded = 0usize;
+        let mut rejected = 0usize;
+        let mut next_id = self.rules.len();
+        for line in text.lines() {
+            if loaded >= MAX_EASYLIST_RULES {
+                break;
+            }
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with('!')
+                || line.starts_with('[')
+                || line.contains("##")
+                || line.contains("#@#")
+                || line.contains("#$#")
+            {
+                continue;
+            }
+            match parse_easylist_rule(line, next_id) {
+                Some(rule) => {
+                    self.rules.push(rule);
+                    loaded += 1;
+                }
+                None => rejected += 1,
+            }
+            next_id += 1;
+        }
+        (loaded, rejected)
+    }
+}
+
+fn parse_easylist_rule(line: &str, id: usize) -> Option<NetworkRule> {
+    let mut rest = line;
+    let mut allow = false;
+    if let Some(body) = rest.strip_prefix("@@") {
+        allow = true;
+        rest = body;
+    }
+    let (body, options_text) = match rest.rfind('$') {
+        Some(index) if !rest[..index].is_empty() => (&rest[..index], Some(&rest[index + 1..])),
+        _ => (rest, None),
+    };
+    let mut resource_types: HashSet<ResourceType> = HashSet::new();
+    let mut third_party: Option<bool> = None;
+    let mut page_domains: Vec<String> = Vec::new();
+    if let Some(options) = options_text {
+        for option in options.split(',') {
+            let option = option.trim();
+            let negated = option.starts_with('~');
+            let value = option.trim_start_matches('~');
+            let (key, argument) = match value.split_once('=') {
+                Some((key, value)) => (key, Some(value)),
+                None => (value, None),
+            };
+            match key.to_ascii_lowercase().as_str() {
+                "script" if !negated && argument.is_none() => {
+                    resource_types.insert(ResourceType::Script);
+                }
+                "image" if !negated && argument.is_none() => {
+                    resource_types.insert(ResourceType::Image);
+                }
+                "stylesheet" | "css" if !negated && argument.is_none() => {
+                    resource_types.insert(ResourceType::Style);
+                }
+                "font" if !negated && argument.is_none() => {
+                    resource_types.insert(ResourceType::Font);
+                }
+                "media" if !negated && argument.is_none() => {
+                    resource_types.insert(ResourceType::Media);
+                }
+                "xmlhttprequest" | "xhr" if !negated && argument.is_none() => {
+                    resource_types.insert(ResourceType::Fetch);
+                }
+                "subdocument" | "object" | "other" if !negated && argument.is_none() => {
+                    resource_types.insert(ResourceType::Other);
+                }
+                "third-party" if argument.is_none() => {
+                    if negated {
+                        third_party = Some(false);
+                    } else {
+                        third_party = Some(true);
+                    }
+                }
+                "domain" if !negated => {
+                    let list = argument?;
+                    for entry in list.split('|') {
+                        let entry = entry.trim();
+                        if entry.starts_with('~') || entry.is_empty() {
+                            continue;
+                        }
+                        page_domains.push(normalize_host(entry));
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+    let domain_part = body.strip_prefix("||")?;
+    let domain = domain_part.trim_end_matches('|').trim_end_matches('^');
+    if domain.is_empty() || domain.contains('*') || domain.contains('/') || domain.contains(' ') {
+        return None;
+    }
+    Some(NetworkRule {
+        id: format!("easylist-{id}"),
+        built_in: false,
+        action: if allow {
+            RuleAction::Allow
+        } else {
+            RuleAction::Block
+        },
+        matcher: RuleMatcher::HostSuffix(domain.to_ascii_lowercase()),
+        resource_types,
+        third_party,
+        page_domains,
+        tracker: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

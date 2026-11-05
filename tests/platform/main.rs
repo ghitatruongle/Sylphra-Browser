@@ -8,5 +8,6 @@ mod renderer_process_ram;
 mod sandbox_isolation;
 mod security_compatibility;
 mod updater;
+mod updater_network;
 mod windows_integration;
 mod worker_isolation;

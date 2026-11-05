@@ -23,8 +23,8 @@ struct GpuPrimitive {
     source_offset: u32,
     source_width: u32,
     source_height: u32,
-    reserved0: u32,
-    reserved1: u32,
+    rotation: u32,
+    aux: u32,
 }
 
 struct GpuState {
@@ -324,6 +324,77 @@ fn prepare_scene(
                 });
                 clip_metadata(&mut metadata, target_width, target_height);
             }
+            ScenePrimitive::RoundedRect {
+                color,
+                radius,
+                rotation,
+                ..
+            } => {
+                metadata.kind = 5;
+                metadata.color = pack_color(*color);
+                metadata.border = radius
+                    .max(0.0)
+                    .min(bounds.width.min(bounds.height) * 0.5)
+                    .ceil() as u32;
+                metadata.rotation = rotation.to_bits();
+                clip_metadata(&mut metadata, target_width, target_height);
+            }
+            ScenePrimitive::ShadowRect {
+                color,
+                radius,
+                blur,
+                rotation,
+                ..
+            } => {
+                metadata.kind = 6;
+                metadata.color = pack_color(*color);
+                metadata.border = radius
+                    .max(0.0)
+                    .min(bounds.width.min(bounds.height) * 0.5)
+                    .ceil() as u32;
+                metadata.aux = blur.max(1.0).to_bits();
+                metadata.rotation = rotation.to_bits();
+                clip_metadata(&mut metadata, target_width, target_height);
+            }
+            ScenePrimitive::GradientRect {
+                angle,
+                stops,
+                rotation,
+                ..
+            } => {
+                metadata.kind = 7;
+                metadata.aux = angle.to_bits();
+                metadata.rotation = rotation.to_bits();
+                metadata.source_height = 0;
+                let packed_stops: Vec<u32> = stops
+                    .iter()
+                    .take(8)
+                    .flat_map(|stop| {
+                        [
+                            (stop.offset.clamp(0.0, 1.0) * 65_535.0).round() as u32,
+                            pack_color(stop.color),
+                        ]
+                    })
+                    .collect();
+                append_source_stops(&mut metadata, &mut sources, &packed_stops)?;
+            }
+            ScenePrimitive::Image {
+                width,
+                height,
+                rgba,
+                ..
+            } => {
+                metadata.kind = 4;
+                metadata.left = metadata.left.max(0);
+                metadata.top = metadata.top.max(0);
+                metadata.right = metadata
+                    .left
+                    .saturating_add(bounds.width.ceil().max(1.0) as i32);
+                metadata.bottom = metadata
+                    .top
+                    .saturating_add(bounds.height.ceil().max(1.0) as i32);
+                append_source(&mut metadata, &mut sources, rgba, *width, *height)?;
+            }
             ScenePrimitive::VideoSurface {
                 width,
                 height,
@@ -385,6 +456,29 @@ fn clip_metadata(metadata: &mut GpuPrimitive, width: u32, height: u32) {
     metadata.bottom = metadata.bottom.clamp(0, height as i32);
 }
 
+fn append_source_stops(
+    metadata: &mut GpuPrimitive,
+    sources: &mut Vec<u32>,
+    packed_stops: &[u32],
+) -> Result<(), String> {
+    if packed_stops.is_empty() {
+        return Err("Gradient needs at least one stop".to_string());
+    }
+    let projected = sources
+        .len()
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(packed_stops.len() * 4))
+        .ok_or_else(|| "GPU source byte count overflow".to_string())?;
+    if projected > MAX_GPU_SOURCE_BYTES {
+        return Err("GPU scene sources exceed the byte budget".to_string());
+    }
+    metadata.source_offset =
+        u32::try_from(sources.len()).map_err(|_| "GPU source offset overflow".to_string())?;
+    metadata.source_width = (packed_stops.len() / 2) as u32;
+    sources.extend_from_slice(packed_stops);
+    Ok(())
+}
+
 fn pack_color(color: Rgba) -> u32 {
     let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0) as u32;
     byte(color.r) | (byte(color.g) << 8) | (byte(color.b) << 16) | (byte(color.a) << 24)
@@ -402,8 +496,8 @@ struct Primitive {
     source_offset: u32,
     source_width: u32,
     source_height: u32,
-    reserved0: u32,
-    reserved1: u32,
+    rotation: u32,
+    aux: u32,
 };
 
 struct Config {
@@ -434,6 +528,43 @@ fn blend(destination: u32, source: u32) -> u32 {
     return red | (green << 8u) | (blue << 16u) | (out_alpha << 24u);
 }
 
+fn mix_colors(a: u32, b: u32, blend_factor: f32) -> u32 {
+    let factor = clamp(blend_factor, 0.0, 1.0);
+    let red = u32(round(mix(f32(channel(a, 0u)), f32(channel(b, 0u)), factor)));
+    let green = u32(round(mix(f32(channel(a, 8u)), f32(channel(b, 8u)), factor)));
+    let blue = u32(round(mix(f32(channel(a, 16u)), f32(channel(b, 16u)), factor)));
+    let alpha = u32(round(mix(f32(channel(a, 24u)), f32(channel(b, 24u)), factor)));
+    return red | (green << 8u) | (blue << 16u) | (alpha << 24u);
+}
+
+fn sdf_rounded(left: f32, top: f32, right: f32, bottom: f32, radius: f32, px: f32, py: f32) -> f32 {
+    let r = clamp(radius, 0.0, min(right - left, bottom - top) * 0.5);
+    let half_w = (right - left) * 0.5;
+    let half_h = (bottom - top) * 0.5;
+    let center_x = (left + right) * 0.5;
+    let center_y = (top + bottom) * 0.5;
+    let qx = abs(px - center_x) - (half_w - r);
+    let qy = abs(py - center_y) - (half_h - r);
+    let ox = max(qx, 0.0);
+    let oy = max(qy, 0.0);
+    return length(vec2<f32>(ox, oy)) + min(max(qx, qy), 0.0) - r;
+}
+
+fn rotate_to_local(primitive: Primitive, x: f32, y: f32) -> vec2<f32> {
+    let rotation_deg = bitcast<f32>(primitive.rotation);
+    if (abs(rotation_deg) <= 0.001) {
+        return vec2<f32>(x, y);
+    }
+    let radians = rotation_deg * 0.017453292519943295;
+    let center_x = f32(primitive.left + primitive.right) * 0.5;
+    let center_y = f32(primitive.top + primitive.bottom) * 0.5;
+    let dx = x + 0.5 - center_x;
+    let dy = y + 0.5 - center_y;
+    let s = sin(radians);
+    let c = cos(radians);
+    return vec2<f32>(center_x + dx * c + dy * s, center_y - dx * s + dy * c);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) global: vec3<u32>) {
     if (global.x >= config.width || global.y >= config.height) { return; }
@@ -442,29 +573,82 @@ fn main(@builtin(global_invocation_id) global: vec3<u32>) {
     var result = 0u;
     for (var index = 0u; index < config.primitive_count; index = index + 1u) {
         let primitive = primitives[index];
-        if (x < primitive.left || x >= primitive.right || y < primitive.top || y >= primitive.bottom) {
+        let rotation_deg = bitcast<f32>(primitive.rotation);
+        let rotated = abs(rotation_deg) > 0.001;
+        if (!rotated && (x < primitive.left || x >= primitive.right || y < primitive.top || y >= primitive.bottom)) {
             continue;
         }
+        let local = rotate_to_local(primitive, f32(x), f32(y));
+        let px = local.x;
+        let py = local.y;
         var source = 0u;
         if (primitive.kind == 0u) {
-            source = primitive.color;
+            if (px >= f32(primitive.left) && px < f32(primitive.right) && py >= f32(primitive.top) && py < f32(primitive.bottom)) {
+                source = primitive.color;
+            }
         } else if (primitive.kind == 1u) {
-            let border = i32(primitive.border);
-            if (x < primitive.left + border || x >= primitive.right - border || y < primitive.top + border || y >= primitive.bottom - border) {
+            let border = f32(primitive.border);
+            if (px >= f32(primitive.left) && px < f32(primitive.right) && py >= f32(primitive.top) && py < f32(primitive.bottom)
+                && (px < f32(primitive.left) + border || px >= f32(primitive.right) - border || py < f32(primitive.top) + border || py >= f32(primitive.bottom) - border)) {
                 source = primitive.color;
             }
         } else if (primitive.kind == 2u) {
-            let source_x = u32(x - primitive.left);
-            let source_y = u32(y - primitive.top);
+            let source_x = u32(px - f32(primitive.left));
+            let source_y = u32(py - f32(primitive.top));
             if (source_x < primitive.source_width && source_y < primitive.source_height) {
                 source = sources[primitive.source_offset + source_y * primitive.source_width + source_x];
             }
         } else if (primitive.kind == 4u) {
-            let output_width = u32(max(1, primitive.right - primitive.left));
-            let output_height = u32(max(1, primitive.bottom - primitive.top));
-            let source_x = u32(x - primitive.left) * primitive.source_width / output_width;
-            let source_y = u32(y - primitive.top) * primitive.source_height / output_height;
-            source = sources[primitive.source_offset + source_y * primitive.source_width + source_x];
+            let output_width = max(1.0, f32(primitive.right - primitive.left));
+            let output_height = max(1.0, f32(primitive.bottom - primitive.top));
+            let source_x = u32((px - f32(primitive.left)) * f32(primitive.source_width) / output_width);
+            let source_y = u32((py - f32(primitive.top)) * f32(primitive.source_height) / output_height);
+            if (source_x < primitive.source_width && source_y < primitive.source_height) {
+                source = sources[primitive.source_offset + source_y * primitive.source_width + source_x];
+            }
+        } else if (primitive.kind == 5u) {
+            if (sdf_rounded(f32(primitive.left), f32(primitive.top), f32(primitive.right), f32(primitive.bottom), f32(primitive.border), px, py) <= 0.0) {
+                source = primitive.color;
+            }
+        } else if (primitive.kind == 6u) {
+            let blur = max(bitcast<f32>(primitive.aux), 1.0);
+            let distance = sdf_rounded(f32(primitive.left) + blur, f32(primitive.top) + blur, f32(primitive.right) - blur, f32(primitive.bottom) - blur, f32(primitive.border), px, py);
+            if (distance > 0.0) {
+                let coverage = 1.0 - clamp(distance / blur, 0.0, 1.0);
+                if (coverage > 0.0) {
+                    let alpha = u32(round(f32(channel(primitive.color, 24u)) * coverage));
+                    source = (primitive.color & 0xFFFFFFu) | (alpha << 24u);
+                }
+            }
+        } else if (primitive.kind == 7u) {
+            let radians = bitcast<f32>(primitive.aux) * 0.017453292519943295;
+            let dir_x = sin(radians);
+            let dir_y = -cos(radians);
+            let box_width = f32(primitive.right - primitive.left);
+            let box_height = f32(primitive.bottom - primitive.top);
+            let half_length = max((abs(box_width * dir_x) + abs(box_height * dir_y)) * 0.5, 1.0);
+            let center_x = f32(primitive.left + primitive.right) * 0.5;
+            let center_y = f32(primitive.top + primitive.bottom) * 0.5;
+            let t = clamp(((px - center_x) * dir_x + (py - center_y) * dir_y) / half_length + 0.5, 0.0, 1.0);
+            var gradient_color = sources[primitive.source_offset + 1u];
+            if (primitive.source_width > 1u) {
+                gradient_color = sources[primitive.source_offset + (primitive.source_width - 1u) * 2u + 1u];
+            }
+            for (var i = 0u; i + 1u < primitive.source_width; i = i + 1u) {
+                let a_off = f32(sources[primitive.source_offset + i * 2u]) / 65535.0;
+                let b_off = f32(sources[primitive.source_offset + (i + 1u) * 2u]) / 65535.0;
+                let a_color = sources[primitive.source_offset + i * 2u + 1u];
+                let b_color = sources[primitive.source_offset + (i + 1u) * 2u + 1u];
+                if (t <= a_off) {
+                    gradient_color = a_color;
+                    break;
+                }
+                if (t <= b_off) {
+                    gradient_color = mix_colors(a_color, b_color, (t - a_off) / max(b_off - a_off, 0.0001));
+                    break;
+                }
+            }
+            source = gradient_color;
         }
         result = blend(result, source);
     }
@@ -476,7 +660,38 @@ fn main(@builtin(global_invocation_id) global: vec3<u32>) {
 mod tests {
     use super::*;
     use crate::paint::{DisplayItem, DisplayList};
-    use crate::scene_compositor::CpuCompositor;
+    use crate::scene_compositor::{CpuCompositor, ImagePixels};
+
+    #[test]
+    fn prepare_scene_routes_bound_images_through_gpu_sources() {
+        let list = DisplayList {
+            items: vec![DisplayItem::Image {
+                x: 1.0,
+                y: 1.0,
+                w: 2.0,
+                h: 2.0,
+                url: "img://red".to_string(),
+                alt: String::new(),
+                cached: true,
+            }],
+            width: 8.0,
+            height: 8.0,
+            ..Default::default()
+        };
+        let mut scene = RetainedScene::from_display_list(1, &list).unwrap();
+        let pixels = ImagePixels {
+            width: 1,
+            height: 1,
+            rgba: std::sync::Arc::new(vec![255, 0, 0, 255]),
+        };
+        assert_eq!(scene.bind_images(&|_| Some(pixels.clone())), 1);
+        let (primitives, sources) = prepare_scene(&scene, 8, 8).unwrap();
+        assert_eq!(primitives.len(), 1);
+        assert_eq!(primitives[0].kind, 4);
+        assert_eq!(primitives[0].source_width, 1);
+        assert_eq!(primitives[0].source_height, 1);
+        assert_eq!(sources, vec![255u32 | (255u32 << 24)]);
+    }
 
     fn reference_scene() -> RetainedScene {
         RetainedScene::from_display_list(

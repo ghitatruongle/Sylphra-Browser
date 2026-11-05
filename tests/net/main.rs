@@ -1,6 +1,7 @@
 mod adblock_boundedness;
 mod adblock_page_integrity;
 mod content_security;
+mod easylist;
 mod network;
 mod network_local;
 mod network_scheduler;

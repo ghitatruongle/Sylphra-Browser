@@ -1443,6 +1443,30 @@ impl LiveDocument {
             }
             return Ok(actions);
         }
+        if key == "Backspace" && self.is_text_entry(target) {
+            if self.element_tag(target).as_deref() == Some("textarea") {
+                let mut current = self.text_content(target).unwrap_or_default();
+                current.pop();
+                self.set_text_content(target, &current)?;
+            } else {
+                let mut value = self
+                    .get_attribute(target, "value")
+                    .unwrap_or("")
+                    .to_string();
+                value.pop();
+                self.set_attribute(target, "value", &value)?;
+            }
+            let mut input = DomEvent::new("input", target);
+            let _ = self.dispatch_event(target, &mut input)?;
+            actions.push(DefaultAction::InsertText(target, "Backspace".to_string()));
+            return Ok(actions);
+        }
+        if key == "Enter" && self.is_text_entry(target) {
+            if let Some(form) = self.closest_tag(target, "form") {
+                actions.push(DefaultAction::SubmitForm(form));
+            }
+            return Ok(actions);
+        }
         if matches!(key, "Enter" | " ") && self.is_focusable(target) {
             let click = self.click(target)?;
             actions.extend(click.default_actions);

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
+use crate::paint::{GradientStop, LinearGradient};
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CssRule {
     pub selectors: Vec<Selector>,
@@ -14,6 +16,20 @@ pub struct CssRule {
     pub layer_order: Option<usize>,
     #[serde(default)]
     pub source_order: usize,
+    #[serde(default)]
+    pub keyframes: Option<KeyframesRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeyframesRule {
+    pub name: String,
+    pub steps: Vec<KeyframeStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeyframeStep {
+    pub offset: f32,
+    pub declarations: Vec<(String, String)>,
 }
 
 #[derive(
@@ -1500,6 +1516,7 @@ pub struct Transform2D {
     pub translate_y: f64,
     pub scale_x: f64,
     pub scale_y: f64,
+    pub rotation_deg: f64,
 }
 
 impl Default for Transform2D {
@@ -1509,6 +1526,7 @@ impl Default for Transform2D {
             translate_y: 0.0,
             scale_x: 1.0,
             scale_y: 1.0,
+            rotation_deg: 0.0,
         }
     }
 }
@@ -1559,6 +1577,9 @@ impl Transform2D {
                 "scaley" if values.len() == 1 => {
                     transform.scale_y *= values[0].parse::<f64>().ok()?.clamp(0.01, 100.0);
                 }
+                "rotate" | "rotatez" if values.len() == 1 => {
+                    transform.rotation_deg += parse_transform_angle_deg(values[0])?;
+                }
                 _ => return None,
             }
             saw_transform = true;
@@ -1581,6 +1602,298 @@ fn parse_transform_length(value: &str) -> Option<f64> {
             .ok()
             .map(|v| v.clamp(-1_000_000.0, 1_000_000.0))
     }
+}
+
+fn parse_transform_angle_deg(value: &str) -> Option<f64> {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(deg) = value.strip_suffix("deg") {
+        deg.trim().parse::<f64>().ok()
+    } else if let Some(rad) = value.strip_suffix("rad") {
+        rad.trim().parse::<f64>().ok().map(f64::to_degrees)
+    } else if let Some(turn) = value.strip_suffix("turn") {
+        turn.trim().parse::<f64>().ok().map(|turns| turns * 360.0)
+    } else {
+        value.parse::<f64>().ok()
+    }
+}
+
+pub fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
+    let open = value.find('(')?;
+    let close = value.rfind(')')?;
+    let body = &value[open + 1..close];
+    let mut parts = split_top_level(body);
+    if parts.is_empty() {
+        return None;
+    }
+    let mut angle_deg = 180.0_f32;
+    let first = parts.remove(0);
+    let trimmed_first = first.trim();
+    if let Some(rest) = trimmed_first
+        .strip_prefix("to ")
+        .map(str::to_ascii_lowercase)
+    {
+        angle_deg = match rest.as_str() {
+            "right" => 90.0,
+            "left" => 270.0,
+            "top" => 0.0,
+            "bottom" => 180.0,
+            "top right" => 45.0,
+            "top left" => 315.0,
+            "bottom right" => 135.0,
+            "bottom left" => 225.0,
+            _ => 180.0,
+        };
+    } else if let Some(deg) = trimmed_first
+        .strip_suffix("deg")
+        .and_then(|deg| deg.trim().parse::<f32>().ok())
+    {
+        angle_deg = deg;
+    } else if !trimmed_first.contains("rgb")
+        && !trimmed_first.starts_with('#')
+        && !trimmed_first.starts_with("hsl")
+        && crate::paint::parse_css_color(trimmed_first).is_some()
+    {
+        parts.insert(0, first.clone());
+        angle_deg = 180.0;
+    } else {
+        parts.insert(0, first.clone());
+    }
+
+    let mut stops: Vec<GradientStop> = Vec::new();
+    for part in parts.iter() {
+        let text = part.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut tokens = text.split_whitespace().collect::<Vec<_>>();
+        let mut offset: Option<f32> = None;
+        if let Some(last) = tokens.last() {
+            let lower = last.to_ascii_lowercase();
+            if let Some(percent) = lower.strip_suffix('%') {
+                offset = percent.trim().parse::<f32>().ok().map(|v| v / 100.0);
+            } else if let Some(px) = lower.strip_suffix("px") {
+                offset = px.trim().parse::<f32>().ok();
+            }
+            if offset.is_some() {
+                tokens.pop();
+            }
+        }
+        let color_text = tokens.join(" ");
+        let color = crate::paint::parse_css_color(&color_text)?;
+        stops.push(GradientStop {
+            offset: offset.unwrap_or(f32::NAN),
+            color,
+        });
+        if stops.len() >= MAX_GRADIENT_STOPS {
+            break;
+        }
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    fill_implicit_gradient_offsets(&mut stops);
+    Some(LinearGradient { angle_deg, stops })
+}
+
+const MAX_GRADIENT_STOPS: usize = 8;
+
+fn split_top_level(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0_usize;
+    let mut current = String::new();
+    for character in value.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                current.push(character);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if depth == 0 => parts.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn fill_implicit_gradient_offsets(stops: &mut [GradientStop]) {
+    let count = stops.len();
+    for (index, stop) in stops.iter_mut().enumerate() {
+        if stop.offset.is_nan() {
+            stop.offset = if count == 1 {
+                0.0
+            } else {
+                index as f32 / (count - 1) as f32
+            };
+        }
+    }
+    for index in 1..stops.len() {
+        if stops[index].offset < stops[index - 1].offset {
+            stops[index].offset = stops[index - 1].offset;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridTrackSize {
+    Fr(f64),
+    Pixels(f64),
+    Percent(f64),
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridTrack {
+    pub min: GridTrackSize,
+    pub max: GridTrackSize,
+    pub auto_repeat: bool,
+}
+
+const MAX_GRID_TRACKS: usize = 64;
+
+pub fn parse_grid_tracks(template: &str) -> Option<Vec<GridTrack>> {
+    let text = template.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut tracks = Vec::new();
+    for token in split_tracks(text) {
+        let token = token.trim();
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("repeat(") {
+            let open = token.find('(')?;
+            let close = token.rfind(')')?;
+            if close < open {
+                return None;
+            }
+            let parts = split_top_level(&token[open + 1..close]);
+            if parts.len() != 2 {
+                return None;
+            }
+            let count_text = parts[0].trim().to_ascii_lowercase();
+            let spec = parse_grid_tracks(parts[1].trim())?;
+            if count_text == "auto-fit" || count_text == "auto-fill" {
+                let representative = *spec.first()?;
+                tracks.push(GridTrack {
+                    min: representative.min,
+                    max: representative.max,
+                    auto_repeat: true,
+                });
+            } else {
+                let count = count_text.parse::<usize>().ok()?.clamp(1, 64);
+                for _ in 0..count {
+                    tracks.extend_from_slice(&spec);
+                }
+            }
+        } else {
+            tracks.push(parse_single_track(&lower)?);
+        }
+        if tracks.len() > MAX_GRID_TRACKS {
+            return None;
+        }
+    }
+    if tracks.is_empty() {
+        return None;
+    }
+    Some(tracks)
+}
+
+fn parse_single_track(token: &str) -> Option<GridTrack> {
+    if let Some(rest) = token.strip_prefix("minmax(") {
+        let inner = rest.strip_suffix(')')?;
+        let parts = split_top_level(inner);
+        if parts.len() != 2 {
+            return None;
+        }
+        return Some(GridTrack {
+            min: parse_track_size(parts[0].trim())?,
+            max: parse_track_size(parts[1].trim())?,
+            auto_repeat: false,
+        });
+    }
+    if let Some(rest) = token.strip_prefix("fit-content(") {
+        let inner = rest.strip_suffix(')')?;
+        return Some(GridTrack {
+            min: GridTrackSize::Auto,
+            max: parse_track_size(inner.trim())?,
+            auto_repeat: false,
+        });
+    }
+    let size = parse_track_size(token)?;
+    Some(match size {
+        GridTrackSize::Fr(value) => GridTrack {
+            min: GridTrackSize::Auto,
+            max: GridTrackSize::Fr(value),
+            auto_repeat: false,
+        },
+        other => GridTrack {
+            min: other,
+            max: other,
+            auto_repeat: false,
+        },
+    })
+}
+
+fn parse_track_size(token: &str) -> Option<GridTrackSize> {
+    let token = token.trim();
+    if token == "auto" || token == "min-content" || token == "max-content" {
+        return Some(GridTrackSize::Auto);
+    }
+    if let Some(value) = token.strip_suffix("fr") {
+        return value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| GridTrackSize::Fr(value.clamp(0.0, 1_000.0)));
+    }
+    if let Some(value) = token.strip_suffix("px") {
+        return value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| GridTrackSize::Pixels(value.max(0.0)));
+    }
+    if let Some(value) = token.strip_suffix('%') {
+        return value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| GridTrackSize::Percent(value.clamp(0.0, 100.0)));
+    }
+    None
+}
+
+fn split_tracks(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0_usize;
+    for character in value.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                current.push(character);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            character if character.is_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            character => current.push(character),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -3364,6 +3677,25 @@ fn parse_css_with_context(
                     visited_imports,
                     layer_map,
                 ));
+            } else if let Some(keyframes_header) = at_trimmed.strip_prefix("@keyframes") {
+                let name = keyframes_header
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(|quote| quote == '"' || quote == '\'')
+                    .to_string();
+                if !name.is_empty() {
+                    rules.push(CssRule {
+                        selectors: Vec::new(),
+                        declarations: Vec::new(),
+                        specificity: (0, 0, 0),
+                        origin,
+                        layer: layer.clone(),
+                        layer_order,
+                        source_order: 0,
+                        keyframes: Some(parse_keyframes_body(&name, &body)),
+                    });
+                }
             }
 
             continue;
@@ -3492,6 +3824,7 @@ fn parse_css_with_context(
                     layer: layer.clone(),
                     layer_order,
                     source_order,
+                    keyframes: None,
                 });
             }
         }
@@ -3518,6 +3851,87 @@ fn parse_import_url(stmt: &str) -> Option<String> {
         return Some(stmt[1..=end].to_string());
     }
     None
+}
+
+fn parse_keyframes_body(name: &str, body: &str) -> KeyframesRule {
+    let chars: Vec<char> = body.chars().collect();
+    let mut pos = 0_usize;
+    let mut steps: Vec<KeyframeStep> = Vec::new();
+    while pos < chars.len() {
+        while pos < chars.len() && chars[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos >= chars.len() {
+            break;
+        }
+        let selector_start = pos;
+        while pos < chars.len() && chars[pos] != '{' {
+            pos += 1;
+        }
+        if pos >= chars.len() {
+            break;
+        }
+        let selector: String = chars[selector_start..pos].iter().collect();
+        pos += 1;
+        let body_start = pos;
+        let mut depth = 1_usize;
+        while pos < chars.len() && depth > 0 {
+            if chars[pos] == '{' {
+                depth += 1;
+            } else if chars[pos] == '}' {
+                depth -= 1;
+            }
+            pos += 1;
+        }
+        let step_body: String = chars[body_start..pos.saturating_sub(1)].iter().collect();
+        let mut declarations: Vec<(String, String)> = Vec::new();
+        for part in step_body.split(';') {
+            let Some((property, value)) = part.split_once(':') else {
+                continue;
+            };
+            let property = property.trim().to_ascii_lowercase();
+            if property.is_empty() {
+                continue;
+            }
+            declarations.push((property, value.trim().to_string()));
+            if declarations.len() >= 16 {
+                break;
+            }
+        }
+        for selector_part in selector.split(',') {
+            let selector_part = selector_part.trim().to_ascii_lowercase();
+            let offset = if selector_part == "from" {
+                Some(0.0_f32)
+            } else if selector_part == "to" {
+                Some(1.0_f32)
+            } else if let Some(percent) = selector_part.strip_suffix('%') {
+                percent
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .map(|value| (value / 100.0).clamp(0.0, 1.0))
+            } else {
+                None
+            };
+            let Some(offset) = offset else {
+                continue;
+            };
+            steps.push(KeyframeStep {
+                offset,
+                declarations: declarations.clone(),
+            });
+            if steps.len() >= 32 {
+                break;
+            }
+        }
+        if steps.len() >= 32 {
+            break;
+        }
+    }
+    KeyframesRule {
+        name: name.to_string(),
+        steps,
+    }
 }
 
 fn split_supports_top_level<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {

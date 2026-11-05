@@ -1,5 +1,6 @@
 pub mod accessibility;
 pub mod application_profiles;
+pub mod favicons;
 pub mod image_loader;
 pub mod local_file;
 pub mod messaging;

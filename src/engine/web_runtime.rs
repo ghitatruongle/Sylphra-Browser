@@ -5408,6 +5408,7 @@ pub struct PageRuntime {
     realm: RuntimeRealm,
     state: PageRuntimeState,
     report: RuntimeReport,
+    pending_submission: Option<String>,
 }
 
 impl PageRuntime {
@@ -5460,6 +5461,7 @@ impl PageRuntime {
         state.capabilities.insert(HostCapability::SvgShapes);
         let live_dom = LiveDocument::from_element(dom, css_rules, viewport_width);
         Ok(Self {
+            pending_submission: None,
             live_dom,
             engine: crate::javascript::JsvEngine::new(),
             realm,
@@ -5769,6 +5771,89 @@ impl PageRuntime {
         &self.report
     }
 
+    pub fn take_pending_submission(&mut self) -> Option<String> {
+        self.pending_submission.take()
+    }
+
+    pub fn has_focused_text_entry(&self) -> bool {
+        self.live_dom
+            .focused()
+            .is_some_and(|node| self.is_text_entry(node))
+    }
+
+    pub fn focused_node(&self) -> Option<NodeId> {
+        self.live_dom.focused()
+    }
+
+    pub fn query_node(&self, selector: &str) -> Option<NodeId> {
+        self.live_dom.query_selector(selector)
+    }
+
+    pub fn is_password_input(&self, node: NodeId) -> bool {
+        self.live_dom.get_attribute(node, "type") == Some("password")
+    }
+
+    pub fn fill_input_value(&mut self, node: NodeId, value: &str) -> Result<(), String> {
+        self.live_dom.set_attribute(node, "value", value)?;
+        let mut event = DomEvent::new("input", node);
+        let _ = self.live_dom.dispatch_event(node, &mut event)?;
+        let _ = self.js_dispatch_pass(node, &mut event)?;
+        Ok(())
+    }
+
+    pub fn collect_form_credentials(&mut self) -> Option<(String, String)> {
+        let mut password: Option<String> = None;
+        let mut username: Option<String> = None;
+        for node in self.live_dom.document_order() {
+            let tag = match self.live_dom.node(node).map(|entry| &entry.kind) {
+                Some(crate::live_dom::LiveNodeKind::Element { tag, .. }) => tag.clone(),
+                _ => continue,
+            };
+            if tag != "input" {
+                continue;
+            }
+            let input_type = self
+                .live_dom
+                .get_attribute(node, "type")
+                .unwrap_or("text")
+                .to_string();
+            if input_type == "password" {
+                if password.is_none() {
+                    let value = self
+                        .live_dom
+                        .get_attribute(node, "value")
+                        .unwrap_or("")
+                        .to_string();
+                    if !value.is_empty() {
+                        password = Some(value);
+                    }
+                }
+                continue;
+            }
+            if password.is_none() && matches!(input_type.as_str(), "text" | "email" | "") {
+                let name = self
+                    .live_dom
+                    .get_attribute(node, "name")
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let value = self
+                    .live_dom
+                    .get_attribute(node, "value")
+                    .unwrap_or("")
+                    .to_string();
+                if (name.contains("user") || name.contains("email") || name.contains("login"))
+                    && !value.is_empty()
+                {
+                    username = Some(value);
+                }
+            }
+            if username.is_some() && password.is_some() {
+                break;
+            }
+        }
+        Some((username?, password?))
+    }
+
     pub fn report_snapshot(&self) -> RuntimeReport {
         let mut report = self.report.clone();
         report.scheduled_tasks = self.state.timers.len();
@@ -5832,10 +5917,17 @@ impl PageRuntime {
                 DefaultAction::SubmitForm(form) => Some(*form),
                 _ => None,
             });
+            let focused = actions.iter().find_map(|action| match action {
+                DefaultAction::Focus(node) => Some(*node),
+                _ => None,
+            });
             let selected = actions
                 .iter()
                 .any(|action| matches!(action, DefaultAction::SelectOption(..)));
             report.default_actions.extend(actions);
+            if let Some(node) = focused {
+                self.focus(node)?;
+            }
             if has_change || selected {
                 let mut change = DomEvent::new("change", target);
                 let _ = self.live_dom.dispatch_event(target, &mut change)?;
@@ -5955,11 +6047,18 @@ impl PageRuntime {
             let has_input = actions
                 .iter()
                 .any(|action| matches!(action, DefaultAction::InsertText(..)));
+            let submitted_form = actions.iter().find_map(|action| match action {
+                DefaultAction::SubmitForm(form) => Some(*form),
+                _ => None,
+            });
             report.default_actions.extend(actions);
             if has_input {
                 let mut input = DomEvent::new("input", target);
                 let _ = self.live_dom.dispatch_event(target, &mut input)?;
                 let _ = self.js_dispatch_pass(target, &mut input)?;
+            }
+            if let Some(form) = submitted_form {
+                self.run_submit_flow(form)?;
             }
         }
         report.default_prevented = event.default_prevented;
@@ -6377,6 +6476,22 @@ impl PageRuntime {
                 action,
                 body.chars().count()
             ));
+            if method == "get" {
+                let base = self.state.current_url.clone();
+                let resolved = url::Url::parse(&base)
+                    .ok()
+                    .and_then(|base| base.join(action.trim()).ok())
+                    .map(|joined| joined.to_string())
+                    .unwrap_or_else(|| base.clone());
+                let submission_url = if body.is_empty() {
+                    resolved
+                } else if resolved.contains('?') {
+                    format!("{}&{}", resolved, body)
+                } else {
+                    format!("{}?{}", resolved, body)
+                };
+                self.pending_submission = Some(submission_url);
+            }
         }
         Ok(())
     }

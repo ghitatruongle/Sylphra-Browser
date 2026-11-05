@@ -680,6 +680,8 @@ pub struct SylphraApp {
     show_bookmarks_bar: bool,
     find_bar_open: bool,
     find_query: String,
+    find_index: usize,
+    reader_mode_active: bool,
     zoom_percent: u16,
     history_query: String,
     homepage_input: String,
@@ -690,7 +692,6 @@ pub struct SylphraApp {
     pending_prepares: HashMap<usize, u64>,
 
     pending_image_batches: HashMap<usize, u64>,
-    find_match_cache: std::cell::RefCell<(usize, String, Option<usize>)>,
     suggestions_cache: std::cell::RefCell<(String, SuggestionMatches)>,
     load_cancellations: HashMap<usize, crate::network_scheduler::CancellationToken>,
 
@@ -701,6 +702,7 @@ pub struct SylphraApp {
     canvas_cache: canvas::Cache,
 
     page_image_handles: Arc<HashMap<String, iced::widget::image::Handle>>,
+    favicons: crate::favicons::FaviconStore,
 
     last_display_rebuild: Option<std::time::Instant>,
 
@@ -730,6 +732,21 @@ pub enum Message {
     OpenUrl(String),
 
     OpenUrlFromPage(String),
+    PageControlActivated {
+        node_id: u64,
+        kind: crate::paint::FormControlKind,
+    },
+    PageKeyInput(String),
+    FaviconLoaded {
+        origin: String,
+        image: Option<crate::image_loader::ImageData>,
+    },
+    DeleteVaultEntry(String),
+    CheckForUpdates,
+    UpdateChecked(Result<crate::updater::UpdateManifest, String>),
+    ToggleReaderMode,
+    FindNext,
+    FindPrev,
     GoBack,
     GoForward,
     Reload,
@@ -931,6 +948,8 @@ impl Application for SylphraApp {
             show_bookmarks_bar,
             find_bar_open: false,
             find_query: String::new(),
+            find_index: 0,
+            reader_mode_active: false,
             zoom_percent,
             history_query: String::new(),
             homepage_input,
@@ -939,13 +958,13 @@ impl Application for SylphraApp {
             pending_loads: HashMap::new(),
             pending_prepares: HashMap::new(),
             pending_image_batches: HashMap::new(),
-            find_match_cache: std::cell::RefCell::new((0, String::new(), None)),
             suggestions_cache: std::cell::RefCell::new((String::new(), Vec::new())),
             load_cancellations: HashMap::new(),
             #[cfg(target_os = "windows")]
             youtube_playback: None,
             display_list: Arc::new(DisplayList::default()),
             page_image_handles: Arc::new(HashMap::new()),
+            favicons: crate::favicons::FaviconStore::new(),
             last_display_rebuild: None,
             last_display_url: String::new(),
             canvas_cache: canvas::Cache::new(),
@@ -1048,6 +1067,64 @@ impl Application for SylphraApp {
                     }
                 }
                 return self.navigate(url);
+            }
+            Message::PageControlActivated { node_id, kind } => {
+                return self.activate_page_control(node_id, kind);
+            }
+            Message::PageKeyInput(key) => {
+                return self.dispatch_page_key(key);
+            }
+            Message::FaviconLoaded { origin, image } => {
+                if let Some(image) = image {
+                    self.favicons.insert(&origin, image);
+                }
+                return Command::none();
+            }
+            Message::DeleteVaultEntry(id) => {
+                if self.browser.password_vault.delete(&id) {
+                    self.status_msg = match self.browser.save_password_vault() {
+                        Ok(()) => "Removed the saved login".to_string(),
+                        Err(error) => format!("Vault save failed: {error}"),
+                    };
+                }
+                return Command::none();
+            }
+            Message::CheckForUpdates => {
+                self.status_msg = "Checking for updates…".to_string();
+                return Command::perform(
+                    tokio::task::spawn_blocking(|| {
+                        crate::updater::fetch_manifest(crate::updater::update_source_url())
+                            .map_err(|error| format!("{error:?}"))
+                    }),
+                    |joined| match joined {
+                        Ok(result) => Message::UpdateChecked(result),
+                        Err(error) => {
+                            Message::UpdateChecked(Err(format!("update task failed: {error}")))
+                        }
+                    },
+                );
+            }
+            Message::UpdateChecked(result) => {
+                match result {
+                    Ok(manifest) => match self.browser.updater.check_update(&manifest) {
+                        Ok(true) => {
+                            self.status_msg = format!(
+                                "Update {} is available — see release notes on the project page",
+                                manifest.version
+                            );
+                        }
+                        Ok(false) => {
+                            self.status_msg = "You are running the latest version".to_string();
+                        }
+                        Err(error) => {
+                            self.status_msg = format!("Update check failed: {error:?}");
+                        }
+                    },
+                    Err(error) => {
+                        self.status_msg = format!("Update check failed: {error}");
+                    }
+                }
+                return Command::none();
             }
             Message::GoBack => {
                 let outcome = self.browser.go_back();
@@ -1787,6 +1864,33 @@ impl Application for SylphraApp {
             }
             Message::FindQueryChanged(q) => {
                 self.find_query = q;
+                self.find_index = 0;
+            }
+            Message::FindNext => {
+                let count = self.find_match_count();
+                if count > 0 {
+                    self.find_index = (self.find_index + 1) % count;
+                    self.status_msg = format!("Match {} of {}", self.find_index + 1, count);
+                }
+                return Command::none();
+            }
+            Message::FindPrev => {
+                let count = self.find_match_count();
+                if count > 0 {
+                    self.find_index = (self.find_index + count - 1) % count;
+                    self.status_msg = format!("Match {} of {}", self.find_index + 1, count);
+                }
+                return Command::none();
+            }
+            Message::ToggleReaderMode => {
+                self.reader_mode_active = !self.reader_mode_active;
+                self.canvas_cache.clear();
+                self.status_msg = if self.reader_mode_active {
+                    "Reader mode is on — the page text is distilled for reading".to_string()
+                } else {
+                    "Reader mode is off".to_string()
+                };
+                return Command::none();
             }
             Message::ZoomIn => {
                 self.zoom_percent = zoom_step_in(self.zoom_percent);
@@ -2933,6 +3037,14 @@ fn handle_keyboard(
         }
     }
 
+    if !modifiers.control() && !modifiers.alt() && !modifiers.shift() && !modifiers.logo() {
+        match &key {
+            Key::Named(Named::Backspace) => return Some(Message::PageKeyInput("Backspace".into())),
+            Key::Named(Named::Enter) => return Some(Message::PageKeyInput("Enter".into())),
+            _ => {}
+        }
+    }
+
     if modifiers.control() && modifiers.shift() {
         return match key {
             Key::Character(c) if c == "t" || c == "T" => Some(Message::ReopenClosedTab),
@@ -2944,6 +3056,7 @@ fn handle_keyboard(
             }
             Key::Character(c) if c == "i" || c == "I" => Some(Message::ToggleDevTools),
             Key::Character(c) if c == "g" || c == "G" => Some(Message::ToggleCompat),
+            Key::Character(c) if c == "r" || c == "R" => Some(Message::ToggleReaderMode),
             Key::Named(Named::Tab) => Some(Message::PrevTab),
             _ => None,
         };
@@ -2989,6 +3102,7 @@ fn handle_keyboard(
 
     match key {
         Key::Named(Named::Escape) => Some(Message::EscapePressed),
+        Key::Character(c) if !c.is_empty() => Some(Message::PageKeyInput(c.to_string())),
         _ => None,
     }
 }
@@ -3519,6 +3633,121 @@ impl SylphraApp {
         )
     }
 
+    fn activate_page_control(
+        &mut self,
+        node_id: u64,
+        kind: crate::paint::FormControlKind,
+    ) -> Command<Message> {
+        self.show_suggestions = false;
+        let mut autofilled = false;
+        let submission: Option<String> = {
+            let Some(tab) = self.browser.tabs.active_tab_mut() else {
+                return Command::none();
+            };
+            let Some(runtime) = tab.runtime.as_mut() else {
+                return Command::none();
+            };
+            let node = node_id as crate::live_dom::NodeId;
+            match kind {
+                crate::paint::FormControlKind::Button => {
+                    let _ = runtime.click(node);
+                }
+                crate::paint::FormControlKind::TextInput
+                | crate::paint::FormControlKind::Select => {
+                    let _ = runtime.focus(node);
+                    if runtime.is_password_input(node) {
+                        let page_url = tab.url.clone();
+                        let entry = self
+                            .browser
+                            .password_vault
+                            .find_for_origin(&page_url)
+                            .into_iter()
+                            .next()
+                            .map(|entry| entry.id.clone());
+                        if let Some(id) = entry {
+                            if let Some((_username, password)) =
+                                self.browser.password_vault.reveal(&id)
+                            {
+                                if runtime.fill_input_value(node, &password).is_ok() {
+                                    autofilled = true;
+                                    self.status_msg =
+                                        "Autofilled password from the vault".to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let render = runtime.refresh_render().clone();
+            let submission = runtime.take_pending_submission();
+            tab.set_dom(render.dom);
+            tab.set_layout(render.layout);
+            submission
+        };
+        if submission.is_some() {
+            let credentials = {
+                let tab = self.browser.tabs.active_tab_mut();
+                match tab.and_then(|tab| tab.runtime.as_mut()) {
+                    Some(runtime) => runtime.collect_form_credentials(),
+                    None => None,
+                }
+            };
+            if let Some((username, password)) = credentials {
+                let page_url = self
+                    .browser
+                    .tabs
+                    .active_tab()
+                    .map(|tab| tab.url.clone())
+                    .unwrap_or_default();
+                if self
+                    .browser
+                    .password_vault
+                    .add(&page_url, &username, &password)
+                    .is_ok()
+                {
+                    match self.browser.save_password_vault() {
+                        Ok(()) => {
+                            self.status_msg = "Saved the login to the password vault".to_string()
+                        }
+                        Err(error) => self.status_msg = format!("Vault save failed: {error}"),
+                    }
+                }
+            }
+        }
+        self.rebuild_display_list();
+        if autofilled {
+            return Command::none();
+        }
+        match submission {
+            Some(url) => {
+                if url.starts_with("file://") {
+                    self.status_msg = "Blocked: web pages cannot open local files".to_string();
+                    return Command::none();
+                }
+                self.navigate(url)
+            }
+            None => Command::none(),
+        }
+    }
+
+    fn dispatch_page_key(&mut self, key: String) -> Command<Message> {
+        let Some(tab) = self.browser.tabs.active_tab_mut() else {
+            return Command::none();
+        };
+        let Some(runtime) = tab.runtime.as_mut() else {
+            return Command::none();
+        };
+        if !runtime.has_focused_text_entry() {
+            return Command::none();
+        }
+        let _ = runtime.dispatch_keyboard("keydown", &key);
+        let render = runtime.refresh_render().clone();
+        tab.set_dom(render.dom);
+        tab.set_layout(render.layout);
+        self.rebuild_display_list();
+        Command::none()
+    }
+
     fn refresh_image_handles(&mut self) {
         let mut handles: HashMap<String, iced::widget::image::Handle> = HashMap::new();
         for item in &self.display_list.items {
@@ -3527,13 +3756,13 @@ impl SylphraApp {
                     continue;
                 }
                 if let Some(data) = self.browser.image_cache.get_decoded(url) {
-                    let (width, height, pixels) = match std::sync::Arc::try_unwrap(data) {
-                        Ok(owned) => (owned.width, owned.height, owned.rgba_pixels),
-                        Err(shared) => (shared.width, shared.height, shared.rgba_pixels.clone()),
-                    };
                     handles.insert(
                         url.clone(),
-                        iced::widget::image::Handle::from_pixels(width, height, pixels),
+                        iced::widget::image::Handle::from_pixels(
+                            data.width,
+                            data.height,
+                            data.rgba_pixels.clone(),
+                        ),
                     );
                 }
             }
@@ -3556,7 +3785,29 @@ impl SylphraApp {
         }
         self.rebuild_display_list();
         self.browser.persist_session();
-        self.schedule_image_loading()
+        let favicon_fetch = self.schedule_favicon_fetch();
+        Command::batch([self.schedule_image_loading(), favicon_fetch])
+    }
+
+    fn schedule_favicon_fetch(&mut self) -> Command<Message> {
+        let Some(url) = self.browser.tabs.active_tab().map(|t| t.url.clone()) else {
+            return Command::none();
+        };
+        if is_internal_page(&url) || self.favicons.contains(&url) {
+            return Command::none();
+        }
+        Command::perform(
+            async move {
+                let origin = url.clone();
+                let image =
+                    tokio::task::spawn_blocking(move || crate::favicons::fetch_favicon_sync(&url))
+                        .await
+                        .ok()
+                        .flatten();
+                Message::FaviconLoaded { origin, image }
+            },
+            |message| message,
+        )
     }
 
     fn observe_navigation_memory(&mut self) -> Command<Message> {
@@ -3832,12 +4083,31 @@ impl SylphraApp {
                 title.clone()
             };
 
-            let label = row![
-                text(icon_str).size(11),
-                text(truncate_label(&display_title, 18)).size(12),
-            ]
-            .spacing(6)
-            .align_items(iced::Alignment::Center);
+            let favicon_pixels =
+                if *is_discarded || *is_sleeping || *incognito || is_internal_page(url) {
+                    None
+                } else {
+                    self.favicons.get(url)
+                };
+
+            let mut label = row![].spacing(6).align_items(iced::Alignment::Center);
+            match favicon_pixels {
+                Some(data) => {
+                    label = label.push(
+                        iced::widget::image(iced::widget::image::Handle::from_pixels(
+                            data.width,
+                            data.height,
+                            data.rgba_pixels.clone(),
+                        ))
+                        .width(Length::Fixed(14.0))
+                        .height(Length::Fixed(14.0)),
+                    );
+                }
+                None => {
+                    label = label.push(text(icon_str).size(11));
+                }
+            }
+            label = label.push(text(truncate_label(&display_title, 18)).size(12));
 
             let tab_btn = button(label)
                 .on_press(Message::SelectTab(*id))
@@ -4345,6 +4615,17 @@ impl SylphraApp {
             reload_btn,
             home_btn,
             theme_btn,
+            button(
+                text(if self.reader_mode_active {
+                    "📖"
+                } else {
+                    "▤"
+                })
+                .size(15),
+            )
+            .on_press(Message::ToggleReaderMode)
+            .padding([4, 9])
+            .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4])),
             omnibox,
             downloads_btn,
             profile_btn,
@@ -4686,25 +4967,48 @@ impl SylphraApp {
             .into()
     }
 
+    fn find_match_count(&self) -> usize {
+        if self.find_query.is_empty() {
+            0
+        } else {
+            self.rendered_content
+                .to_lowercase()
+                .matches(&self.find_query.to_lowercase())
+                .count()
+        }
+    }
+
+    fn reader_paragraphs(&self) -> Vec<String> {
+        let mut lines: Vec<(i32, String)> = Vec::new();
+        for item in self.display_list.items.iter() {
+            if let DisplayItem::TextRun {
+                y, size, content, ..
+            } = item
+            {
+                let key = (*y / size.max(1.0)).round() as i32;
+                match lines.last_mut() {
+                    Some((last_key, text)) if *last_key == key => {
+                        text.push(' ');
+                        text.push_str(content);
+                    }
+                    _ => lines.push((key, content.clone())),
+                }
+                if lines.len() >= 2_000 {
+                    break;
+                }
+            }
+        }
+        lines.into_iter().map(|(_, text)| text).collect()
+    }
+
     fn build_find_bar(&self, pal: &'static Pal) -> Element<'_, Message> {
+        let count = self.find_match_count();
         let match_count = if self.find_query.is_empty() {
             String::new()
+        } else if count == 0 {
+            "no matches".to_string()
         } else {
-            let mut cache = self.find_match_cache.borrow_mut();
-            if cache.0 != self.rendered_content.len() || cache.1 != self.find_query {
-                let count = self
-                    .rendered_content
-                    .to_lowercase()
-                    .matches(&self.find_query.to_lowercase())
-                    .count();
-                *cache = (
-                    self.rendered_content.len(),
-                    self.find_query.clone(),
-                    Some(count),
-                );
-            }
-            let n = cache.2.unwrap_or(0);
-            format!("{} match{}", n, if n == 1 { "" } else { "es" })
+            format!("{} of {}", self.find_index + 1, count)
         };
 
         let panel = container(
@@ -4719,6 +5023,14 @@ impl SylphraApp {
                 text(match_count)
                     .size(12)
                     .style(iced::theme::Text::from(pal.text_dim)),
+                button(text("▲").size(11))
+                    .on_press(Message::FindPrev)
+                    .padding([4, 7])
+                    .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [4.0; 4])),
+                button(text("▼").size(11))
+                    .on_press(Message::FindNext)
+                    .padding([4, 7])
+                    .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [4.0; 4])),
                 button(text("✕").size(12))
                     .on_press(Message::ToggleFindBar)
                     .padding([4, 8])
@@ -4818,6 +5130,31 @@ impl SylphraApp {
     fn build_web_view(&self, pal: &'static Pal) -> Element<'_, Message> {
         let pixel_mode = self.browser.storage.settings.pixel_rendering;
 
+        if self.reader_mode_active {
+            let size = (15.0 * self.zoom_percent as f32 / 100.0).max(8.0);
+            let paragraphs = self.reader_paragraphs();
+            let items: Vec<Element<'_, Message>> = if paragraphs.is_empty() {
+                vec![text("Reader mode found no article text on this page.")
+                    .size(size)
+                    .style(iced::theme::Text::from(pal.text_dim))
+                    .into()]
+            } else {
+                paragraphs
+                    .into_iter()
+                    .map(|line| {
+                        text(line)
+                            .size(size)
+                            .style(iced::theme::Text::from(pal.text))
+                            .into()
+                    })
+                    .collect()
+            };
+            return scrollable(column(items).spacing(8).padding(24))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
         if pixel_mode && !self.display_list.is_empty() {
             let zoom = self.zoom_percent as f32 / 100.0;
             let base_url = self
@@ -4832,6 +5169,7 @@ impl SylphraApp {
                 self.page_image_handles.clone(),
                 zoom,
                 base_url,
+                Arc::new(self.display_list.form_controls.clone()),
             ));
 
             let mut items: Vec<Element<'_, Message>> =
@@ -5007,6 +5345,53 @@ fn resolve_href(base: &str, href: &str) -> String {
         .unwrap_or_else(|| href.to_string())
 }
 
+fn draw_rotated(
+    frame: &mut canvas::Frame,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rotation_deg: f32,
+    draw: impl FnOnce(&mut canvas::Frame),
+) {
+    if rotation_deg.abs() < f32::EPSILON {
+        draw(frame);
+        return;
+    }
+    let center_x = x + w * 0.5;
+    let center_y = y + h * 0.5;
+    frame.translate(iced::Vector::new(center_x, center_y));
+    frame.rotate(rotation_deg.to_radians());
+    frame.translate(iced::Vector::new(-center_x, -center_y));
+    draw(frame);
+    frame.translate(iced::Vector::new(center_x, center_y));
+    frame.rotate(-rotation_deg.to_radians());
+    frame.translate(iced::Vector::new(-center_x, -center_y));
+}
+
+fn rounded_rect_path(top_left: iced::Point, size: iced::Size, radius: f32) -> canvas::Path {
+    let mut builder = canvas::path::Builder::new();
+    let x = top_left.x;
+    let y = top_left.y;
+    let w = size.width;
+    let h = size.height;
+    let r = radius.min(w * 0.5).min(h * 0.5);
+    builder.move_to(iced::Point::new(x + r, y));
+    builder.line_to(iced::Point::new(x + w - r, y));
+    builder.quadratic_curve_to(iced::Point::new(x + w, y), iced::Point::new(x + w, y + r));
+    builder.line_to(iced::Point::new(x + w, y + h - r));
+    builder.quadratic_curve_to(
+        iced::Point::new(x + w, y + h),
+        iced::Point::new(x + w - r, y + h),
+    );
+    builder.line_to(iced::Point::new(x + r, y + h));
+    builder.quadratic_curve_to(iced::Point::new(x, y + h), iced::Point::new(x, y + h - r));
+    builder.line_to(iced::Point::new(x, y + r));
+    builder.quadratic_curve_to(iced::Point::new(x, y), iced::Point::new(x + r, y));
+    builder.close();
+    builder.build()
+}
+
 struct WebPageWidget<'a> {
     list: Arc<DisplayList>,
     cache: &'a canvas::Cache,
@@ -5014,6 +5399,7 @@ struct WebPageWidget<'a> {
     images: Arc<HashMap<String, iced::widget::image::Handle>>,
     zoom: f32,
     base_url: String,
+    form_controls: Arc<Vec<crate::paint::FormControlRegion>>,
 }
 
 impl<'a> WebPageWidget<'a> {
@@ -5023,6 +5409,7 @@ impl<'a> WebPageWidget<'a> {
         images: Arc<HashMap<String, iced::widget::image::Handle>>,
         zoom: f32,
         base_url: String,
+        form_controls: Arc<Vec<crate::paint::FormControlRegion>>,
     ) -> Self {
         Self {
             list,
@@ -5030,6 +5417,7 @@ impl<'a> WebPageWidget<'a> {
             images,
             zoom,
             base_url,
+            form_controls,
         }
     }
 
@@ -5265,6 +5653,106 @@ impl<'a> iced_core::Widget<Message, Theme, iced::Renderer> for WebPageWidget<'a>
                             ..canvas::Text::default()
                         });
                     }
+                    DisplayItem::RoundedRect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        color,
+                        radius,
+                        rotation,
+                    } => {
+                        let color = to_color(*color);
+                        let radius = radius.clamp(0.0, w.min(*h) * 0.5);
+                        draw_rotated(frame, *x, *y, *w, *h, *rotation, |frame| {
+                            frame.fill(
+                                &rounded_rect_path(
+                                    iced::Point::new(*x, *y),
+                                    iced::Size::new(*w, *h),
+                                    radius,
+                                ),
+                                color,
+                            );
+                        });
+                    }
+                    DisplayItem::ShadowRect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        color,
+                        radius,
+                        blur,
+                        rotation,
+                    } => {
+                        let base = *color;
+                        let radius = radius.clamp(0.0, w.min(*h) * 0.5);
+                        draw_rotated(frame, *x, *y, *w, *h, *rotation, |frame| {
+                            for layer in 0..3u32 {
+                                let inset = blur * layer as f32 / 3.0;
+                                let layer_color = to_color(crate::paint::Rgba {
+                                    a: base.a * (layer as f32 + 1.0) / 3.0,
+                                    ..base
+                                });
+                                frame.fill(
+                                    &rounded_rect_path(
+                                        iced::Point::new(x + inset, y + inset),
+                                        iced::Size::new(
+                                            (w - 2.0 * inset).max(1.0),
+                                            (h - 2.0 * inset).max(1.0),
+                                        ),
+                                        (radius - inset).max(0.0),
+                                    ),
+                                    layer_color,
+                                );
+                            }
+                        });
+                    }
+                    DisplayItem::GradientRect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        angle,
+                        stops,
+                        rotation,
+                    } => {
+                        draw_rotated(frame, *x, *y, *w, *h, *rotation, |frame| {
+                            const STRIPS: usize = 24;
+                            let radians = angle.to_radians();
+                            let dir_x = radians.sin();
+                            let dir_y = -radians.cos();
+                            for strip in 0..STRIPS {
+                                let t = (strip as f32 + 0.5) / STRIPS as f32;
+                                let color = to_color(crate::paint::gradient_color_at(stops, t));
+                                if dir_x.abs() > dir_y.abs() {
+                                    let strip_width = w / STRIPS as f32;
+                                    let position = if dir_x > 0.0 {
+                                        x + strip as f32 * strip_width
+                                    } else {
+                                        x + (STRIPS - 1 - strip) as f32 * strip_width
+                                    };
+                                    frame.fill_rectangle(
+                                        iced::Point::new(position, *y),
+                                        iced::Size::new(strip_width + 0.5, *h),
+                                        color,
+                                    );
+                                } else {
+                                    let strip_height = h / STRIPS as f32;
+                                    let position = if dir_y > 0.0 {
+                                        y + strip as f32 * strip_height
+                                    } else {
+                                        y + (STRIPS - 1 - strip) as f32 * strip_height
+                                    };
+                                    frame.fill_rectangle(
+                                        iced::Point::new(*x, position),
+                                        iced::Size::new(*w, strip_height + 0.5),
+                                        color,
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -5316,6 +5804,23 @@ impl<'a> iced_core::Widget<Message, Theme, iced::Renderer> for WebPageWidget<'a>
                 let effective = self.effective_zoom();
                 let x = pos.x / effective;
                 let y = pos.y / effective;
+                if let Some(region) = self
+                    .form_controls
+                    .iter()
+                    .find(|region| {
+                        x >= region.x
+                            && x < region.x + region.w
+                            && y >= region.y
+                            && y < region.y + region.h
+                    })
+                    .cloned()
+                {
+                    shell.publish(Message::PageControlActivated {
+                        node_id: region.node_id,
+                        kind: region.kind,
+                    });
+                    return iced_core::event::Status::Captured;
+                }
                 if let Some(href) = self.list.link_at(x, y) {
                     let resolved = resolve_href(&self.base_url, href);
                     shell.publish(Message::OpenUrlFromPage(resolved));
@@ -5864,6 +6369,39 @@ impl SylphraApp {
             .into()
     }
 
+    fn build_vault_section(&self, pal: &'static Pal) -> Element<'_, Message> {
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+        if self.browser.password_vault.entries.is_empty() {
+            items.push(
+                text("No saved logins yet.")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text_dim))
+                    .into(),
+            );
+        }
+        for entry in self.browser.password_vault.entries.iter().take(50) {
+            items.push(
+                row![
+                    text(format!("{} — {}", entry.origin, entry.username))
+                        .size(13)
+                        .style(iced::theme::Text::from(pal.text)),
+                    horizontal_space(),
+                    button(
+                        text("Remove")
+                            .size(12)
+                            .style(iced::theme::Text::from(pal.text))
+                    )
+                    .on_press(Message::DeleteVaultEntry(entry.id.clone()))
+                    .padding([4, 10]),
+                ]
+                .spacing(8)
+                .align_items(iced::Alignment::Center)
+                .into(),
+            );
+        }
+        column(items).spacing(6).into()
+    }
+
     fn build_settings_page(&self, pal: &'static Pal) -> Element<'_, Message> {
         let settings = &self.browser.storage.settings;
 
@@ -5913,6 +6451,16 @@ impl SylphraApp {
             text("Settings")
                 .size(24)
                 .style(iced::theme::Text::from(pal.text)),
+            section("Passwords"),
+            self.build_vault_section(pal),
+            section("Updates"),
+            button(
+                text("Check for updates")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text)),
+            )
+            .on_press(Message::CheckForUpdates)
+            .padding([6, 14]),
             section("Appearance"),
             row![
                 text("Theme")
@@ -6476,6 +7024,7 @@ mod widget_tests {
             empty.clone(),
             4.0,
             String::new(),
+            Arc::new(Vec::new()),
         );
         let z = widget.effective_zoom();
         let pixels = 15_000.0 * 1_100.0 * z * z;
@@ -6496,6 +7045,7 @@ mod widget_tests {
             Arc::new(HashMap::new()),
             2.5,
             String::new(),
+            Arc::new(Vec::new()),
         );
         assert!((widget.effective_zoom() - 2.5).abs() < 1e-3);
     }

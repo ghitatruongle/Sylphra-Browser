@@ -5,6 +5,7 @@ pub mod compat_governance;
 pub mod compat_session;
 pub mod installed_app;
 pub mod ipc;
+pub mod password_vault;
 pub mod process_coordinator;
 pub mod release_metrics;
 pub mod release_smoke;

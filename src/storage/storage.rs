@@ -141,6 +141,12 @@ impl Cookie {
             return false;
         }
 
+        if let Some(expires) = self.expires {
+            if expires <= chrono::Utc::now().timestamp() {
+                return false;
+            }
+        }
+
         let base = self.domain.trim_start_matches('.');
         let host = parsed.host_str().unwrap_or("");
         let base = base.to_ascii_lowercase();

@@ -653,6 +653,16 @@ pub(crate) fn response_varies(headers: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
+fn fetch_revalidate_etag(url: &str, etag: &str) -> Result<FetchResult, Box<dyn std::error::Error>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .redirects(0)
+        .user_agent(&browser_ua())
+        .build();
+    execute_fetch(&agent, url, None, &[("If-None-Match", etag)])
+}
+
 fn fetch_revalidate(
     url: &str,
     if_modified_since: &str,
@@ -686,6 +696,16 @@ pub fn fetch_with_cache(
 
         let last_modified = cached.result.headers.get("last-modified").cloned();
         let cached_result = cached.result.clone();
+        if let Some(etag) = cached.etag.clone() {
+            info!("Cache STALE for: {} (etag revalidation)", url);
+            if let Ok(reval) = fetch_revalidate_etag(url, &etag) {
+                if reval.status_code == 304 {
+                    cache.touch(url);
+                    cache.record_hit();
+                    return Ok(cached_result);
+                }
+            }
+        }
         if let Some(lm) = last_modified {
             info!("Cache STALE for: {} (revalidating)", url);
             if let Ok(reval) = fetch_revalidate(url, &lm) {
@@ -727,6 +747,7 @@ pub struct CacheEntry {
     pub result: FetchResult,
     pub cached_at: Instant,
     pub ttl_secs: u64,
+    pub etag: Option<String>,
 }
 
 impl CacheEntry {
@@ -797,10 +818,12 @@ impl ResourceCache {
             }
         }
 
+        let etag = result.headers.get("etag").cloned();
         let entry = CacheEntry {
             result,
             cached_at: Instant::now(),
             ttl_secs,
+            etag,
         };
         self.entries.insert(url.to_string(), entry);
     }

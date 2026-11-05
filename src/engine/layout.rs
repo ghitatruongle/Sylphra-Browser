@@ -1,6 +1,6 @@
 use crate::css_parser::{
-    compute_computed_style, parse_class_attr, ComputedStyle, CssRule, CssUnit, PositionMode,
-    Transform2D,
+    compute_computed_style, parse_class_attr, parse_grid_tracks, ComputedStyle, CssRule, CssUnit,
+    GridTrack, GridTrackSize, PositionMode, Transform2D,
 };
 use crate::parser::Element;
 use std::collections::BTreeMap;
@@ -1567,43 +1567,214 @@ fn layout_grid(
     float_ctx: &mut FloatContext,
     depth: usize,
 ) -> f64 {
-    let columns = grid_column_count(
-        node.computed_style.grid_template_columns.as_deref(),
-        node.children.len(),
-    );
-    let column_width =
-        ((inner_width - gap * columns.saturating_sub(1) as f64) / columns.max(1) as f64).max(0.0);
+    let child_count = node.children.len();
+    if child_count == 0 {
+        return 0.0;
+    }
 
-    let mut line_y = content_y;
-    let mut index = 0;
-    while index < node.children.len() {
-        let row_end = (index + columns).min(node.children.len());
-        let mut row_height: f64 = 0.0;
-        for (col, child) in node.children[index..row_end].iter_mut().enumerate() {
-            if !has_explicit_width(&child.computed_style) {
-                child.rect.width = column_width;
-            }
-            let x = content_x + col as f64 * (column_width + gap);
-            let child_height = layout_node_recursive(
-                child,
-                x,
-                line_y,
-                column_width,
-                font_size,
-                containing_height,
-                root_font_size,
-                float_ctx,
-                depth,
-            );
-            row_height = row_height.max(child_height);
+    let mut column_tracks = expand_grid_tracks(
+        node.computed_style
+            .grid_template_columns
+            .as_deref()
+            .and_then(parse_grid_tracks),
+        child_count,
+    );
+    if column_tracks.is_empty() {
+        let fallback_columns = child_count.clamp(1, 2);
+        column_tracks = vec![
+            GridTrack {
+                min: GridTrackSize::Auto,
+                max: GridTrackSize::Auto,
+                auto_repeat: false
+            };
+            fallback_columns
+        ];
+    }
+    column_tracks.truncate(64);
+    let column_count = column_tracks.len();
+    let column_widths = resolve_track_sizes(&column_tracks, inner_width, gap);
+
+    let placements = place_grid_children(node, column_count);
+    let row_count = placements
+        .iter()
+        .map(|placement| placement.row + placement.row_span)
+        .max()
+        .unwrap_or(1);
+
+    let mut heights: Vec<f64> = Vec::with_capacity(child_count);
+    for (child_index, child) in node.children.iter_mut().enumerate() {
+        let placement = &placements[child_index];
+        let column_start = placement.column;
+        let column_span = placement.column_span;
+        let width = column_widths[column_start..column_start + column_span]
+            .iter()
+            .sum::<f64>()
+            + gap * (column_span - 1) as f64;
+        let x = content_x
+            + column_widths[..column_start].iter().sum::<f64>()
+            + gap * column_start as f64;
+        if !has_explicit_width(&child.computed_style) {
+            child.rect.width = width;
         }
-        line_y += row_height;
-        index = row_end;
-        if index < node.children.len() {
-            line_y += gap;
+        let height = layout_node_recursive(
+            child,
+            x,
+            content_y,
+            width,
+            font_size,
+            containing_height,
+            root_font_size,
+            float_ctx,
+            depth,
+        );
+        heights.push(height);
+    }
+
+    let mut row_heights = vec![0.0_f64; row_count];
+    for (child_index, placement) in placements.iter().enumerate() {
+        if placement.row_span == 1 {
+            row_heights[placement.row] = row_heights[placement.row].max(heights[child_index]);
         }
     }
-    line_y - content_y
+    for (child_index, placement) in placements.iter().enumerate() {
+        if placement.row_span > 1 {
+            let end = (placement.row + placement.row_span).min(row_count);
+            let covered = row_heights[placement.row..end].iter().sum::<f64>()
+                + gap * (end - placement.row - 1) as f64;
+            let deficit = heights[child_index] - covered;
+            if deficit > 0.0 {
+                let each = deficit / (end - placement.row) as f64;
+                for row_height in &mut row_heights[placement.row..end] {
+                    *row_height += each;
+                }
+            }
+        }
+    }
+
+    for (child_index, child) in node.children.iter_mut().enumerate() {
+        let placement = &placements[child_index];
+        let target_y = content_y
+            + row_heights[..placement.row].iter().sum::<f64>()
+            + gap * placement.row as f64;
+        let dy = target_y - child.rect.y;
+        if dy.abs() > f64::EPSILON {
+            translate_subtree(child, 0.0, dy);
+        }
+    }
+
+    row_heights.iter().sum::<f64>() + gap * row_count.saturating_sub(1) as f64
+}
+
+struct GridPlacement {
+    row: usize,
+    column: usize,
+    column_span: usize,
+    row_span: usize,
+}
+
+fn place_grid_children(node: &LayoutNode, column_count: usize) -> Vec<GridPlacement> {
+    let mut occupied: Vec<(usize, usize)> = Vec::new();
+    let mut placements = Vec::with_capacity(node.children.len());
+    for (index, child) in node.children.iter().enumerate() {
+        let column_span = child
+            .computed_style
+            .grid_column_span
+            .clamp(1, 16)
+            .min(column_count)
+            .max(1);
+        let row_span = child.computed_style.grid_row_span.clamp(1, 16);
+        let mut placed = None;
+        'search: for row in 0..node.children.len() + 1 {
+            for column in 0..column_count {
+                if column + column_span > column_count {
+                    break;
+                }
+                let cells = (0..row_span)
+                    .flat_map(|row_offset| {
+                        (0..column_span)
+                            .map(move |column_offset| (row + row_offset, column + column_offset))
+                    })
+                    .collect::<Vec<_>>();
+                if cells.iter().all(|cell| !occupied.contains(cell)) {
+                    occupied.extend_from_slice(&cells);
+                    placed = Some(GridPlacement {
+                        row,
+                        column,
+                        column_span,
+                        row_span,
+                    });
+                    break 'search;
+                }
+            }
+        }
+        let placement = placed.unwrap_or(GridPlacement {
+            row: index,
+            column: 0,
+            column_span: 1,
+            row_span: 1,
+        });
+        placements.push(placement);
+    }
+    placements
+}
+
+fn expand_grid_tracks(spec: Option<Vec<GridTrack>>, child_count: usize) -> Vec<GridTrack> {
+    let Some(tracks) = spec else {
+        return Vec::new();
+    };
+    let mut expanded = Vec::new();
+    for track in tracks {
+        if track.auto_repeat {
+            expanded.extend(std::iter::repeat_n(track, child_count.clamp(1, 64)));
+        } else {
+            expanded.push(track);
+        }
+        if expanded.len() >= 64 {
+            break;
+        }
+    }
+    expanded
+}
+
+fn resolve_track_sizes(tracks: &[GridTrack], reference: f64, gap: f64) -> Vec<f64> {
+    if tracks.is_empty() {
+        return Vec::new();
+    }
+    let mut sizes: Vec<f64> = tracks
+        .iter()
+        .map(|track| resolve_track_fixed(track.max, reference).unwrap_or(0.0))
+        .collect();
+    let grows: Vec<f64> = tracks
+        .iter()
+        .map(|track| resolve_track_growth(track.max))
+        .collect();
+    let gaps = gap * (tracks.len().saturating_sub(1)) as f64;
+    let leftover = reference - gaps - sizes.iter().sum::<f64>();
+    let grow_sum: f64 = grows.iter().sum();
+    if leftover > 0.0 && grow_sum > 0.0 {
+        for (index, grow) in grows.iter().enumerate() {
+            if *grow > 0.0 {
+                sizes[index] += leftover * grow / grow_sum;
+            }
+        }
+    }
+    sizes
+}
+
+fn resolve_track_fixed(size: GridTrackSize, reference: f64) -> Option<f64> {
+    match size {
+        GridTrackSize::Pixels(value) => Some(value.max(0.0)),
+        GridTrackSize::Percent(value) => Some((value * reference / 100.0).max(0.0)),
+        GridTrackSize::Auto | GridTrackSize::Fr(_) => None,
+    }
+}
+
+fn resolve_track_growth(size: GridTrackSize) -> f64 {
+    match size {
+        GridTrackSize::Fr(value) => value.max(0.0),
+        GridTrackSize::Auto => 1.0,
+        GridTrackSize::Pixels(_) | GridTrackSize::Percent(_) => 0.0,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1838,24 +2009,6 @@ fn transform_layout_subtree(
             stack.push((child, depth + 1));
         }
     }
-}
-
-fn grid_column_count(template: Option<&str>, child_count: usize) -> usize {
-    let Some(template) = template.map(str::trim).filter(|value| !value.is_empty()) else {
-        return child_count.clamp(1, 2);
-    };
-    if let Some(repeat) = template.strip_prefix("repeat(") {
-        if let Some((count, _)) = repeat.split_once(',') {
-            if let Ok(count) = count.trim().parse::<usize>() {
-                return count.clamp(1, 12);
-            }
-        }
-    }
-    template
-        .split_ascii_whitespace()
-        .filter(|track| !track.is_empty())
-        .count()
-        .clamp(1, 12)
 }
 
 pub(crate) fn count_layout_nodes(node: &LayoutNode) -> usize {
