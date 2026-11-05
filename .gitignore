@@ -288,3 +288,5 @@ tarpaulin-report.*
 cobertura.xml
 criterion/
 /target/criterion/
+
+/.mimosa/
